@@ -68,7 +68,7 @@ def _gemini_pick(models):
 
 def _resolve_gemini(key):
     with _resolve_lock:
-        if "gemini" in _resolved:
+        if _resolved.get("gemini"):
             return _resolved["gemini"]
         try:
             r = httpx.get(f"{GEMINI_BASE}/models?pageSize=200", headers={"x-goog-api-key": key}, timeout=30)
@@ -84,6 +84,8 @@ def model_name(resolve=True) -> str | None:
     p = provider()
     if not p:
         return None
+    if p == "gemini" and _resolved.get("gemini"):
+        return _resolved["gemini"]
     if os.getenv("LLM_MODEL"):
         return os.getenv("LLM_MODEL")
     if p == "gemini":
@@ -182,9 +184,15 @@ def chat(system: str, messages: list[dict], max_tokens: int = 4000, json_mode: b
                              {"content-type": "application/json", "x-goog-api-key": key}, body)
                 break
             except LLMError as e:
-                if e.status == 404 and not os.getenv("LLM_MODEL"):
-                    _bad_models.add(model)          # retired model: pick another one
-                    _resolved.pop("gemini", None)
+                if e.status == 404:
+                    # retired / unavailable model: use the replacement Google names in the error, else rediscover
+                    _bad_models.add(model)
+                    suggested = [m.rstrip(".") for m in re.findall(r"models/(gemini[\w.\-]+)", str(e)) if m.rstrip(".") not in _bad_models]
+                    with _resolve_lock:
+                        _resolved["gemini"] = suggested[0] if suggested else None
+                        if not suggested:
+                            _resolved.pop("gemini", None)
+                    os.environ.pop("LLM_MODEL", None)
                     continue
                 raise
         else:

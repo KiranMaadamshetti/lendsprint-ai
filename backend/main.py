@@ -28,6 +28,7 @@ from . import brain, db, extraction, llm, pdftext  # noqa: E402
 
 db.init()
 app = FastAPI(title="LendSprint - AI Credit Underwriting Copilot")
+BUILD = "2026-09-26.4"
 
 
 def actor_of(x_actor):
@@ -66,7 +67,7 @@ class ChatIn(BaseModel):
 # ---------------------------------------------------------------------------------------
 @app.get("/api/health")
 def health():
-    return {"ok": True, "llm": llm.status()}
+    return {"ok": True, "build": BUILD, "llm": llm.status()}
 
 
 @app.get("/api/policy")
