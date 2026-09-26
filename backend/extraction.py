@@ -6,7 +6,7 @@ statements we arithmetically reconcile every extracted row against the running b
 Nothing here is borrower-specific: the same prompts run on any upload.
 """
 import re
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from . import llm
 
@@ -103,9 +103,17 @@ PAGE TEXT:
     return out, meta
 
 
-def extract_bank(pages):
+def extract_bank(pages, progress=None):
+    results = [None] * len(pages)
     with ThreadPoolExecutor(max_workers=6) as ex:
-        results = list(ex.map(lambda ip: _bank_page(ip[1], ip[0] == 0), enumerate(pages)))
+        futs = {ex.submit(_bank_page, p, i == 0): i for i, p in enumerate(pages)}
+        done = rows_so_far = 0
+        for fut in as_completed(futs):
+            results[futs[fut]] = fut.result()
+            done += 1
+            rows_so_far += len(results[futs[fut]][0].get("rows", []) or [])
+            if progress:
+                progress({"pages_done": done, "pages_total": len(pages), "rows": rows_so_far})
     fields, rows, latency, model = {}, [], 0, None
     for i, (out, meta) in enumerate(results):
         if i == 0:
@@ -193,9 +201,9 @@ def verify_periods(periods, pages):
     return periods
 
 
-def run_extraction(doc_type, pages):
+def run_extraction(doc_type, pages, progress=None):
     if doc_type == "bank_statement":
-        res = extract_bank(pages)
+        res = extract_bank(pages, progress)
         verify_evidence(res["fields"], pages)
     elif doc_type == "itr":
         res = extract_itr(pages)

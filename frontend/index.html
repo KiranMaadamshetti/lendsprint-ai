@@ -32,7 +32,7 @@
     <main id="main"></main>
   </div>
 
-  <dialog id="new-app-dialog">
+  <dialog id="new-app-dialog" class="wide">
     <form id="new-app-form" method="dialog">
       <h3>New loan application</h3>
       <label>Prefill a synthetic demo case
@@ -50,9 +50,15 @@
         <label>Interest rate (% p.a.)<input name="interest_rate" type="number" step="0.05" required value="12" /></label>
         <label>Purpose<input name="purpose" /></label>
       </div>
+      <h4 class="step-h">Borrower documents</h4>
+      <div class="dropzone" id="new-dropzone">
+        <b>Drop the borrower's PDFs here</b> or <label class="browse">browse<input type="file" id="new-files" accept="application/pdf" multiple hidden></label>
+        <div class="small">Bank statement, ITR and GST returns in any order. Credit Brain works out which is which.</div>
+      </div>
+      <div id="new-file-list" class="file-chips"></div>
       <div class="dialog-actions">
         <button type="button" class="btn" id="cancel-new">Cancel</button>
-        <button type="submit" class="btn primary">Create</button>
+        <button type="submit" class="btn primary" id="create-btn">Create &amp; analyse</button>
       </div>
     </form>
   </dialog>

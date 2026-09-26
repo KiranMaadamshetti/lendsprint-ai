@@ -88,7 +88,8 @@ def client():
     llm.chat = fake_chat
     from backend import main
     import types
-    main.threading = types.SimpleNamespace(Thread=_SyncThread)
+    import threading as _t
+    main.threading = types.SimpleNamespace(Thread=_SyncThread, Lock=_t.Lock)
     return TestClient(main.app)
 
 

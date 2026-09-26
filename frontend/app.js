@@ -39,7 +39,13 @@ async function boot() {
     for (const [k, v] of Object.entries(c)) if (f.elements[k]) f.elements[k].value = v;
     f.dataset.slug = c.slug;
   };
-  $("#new-app-btn").onclick = () => { $("#new-app-form").reset(); delete $("#new-app-form").dataset.slug; $("#new-app-dialog").showModal(); };
+  $("#new-app-btn").onclick = () => { $("#new-app-form").reset(); delete $("#new-app-form").dataset.slug; S.newFiles = []; renderNewFiles(); $("#new-app-dialog").showModal(); };
+  const ndz = $("#new-dropzone"), nfi = $("#new-files");
+  const addFiles = (fl) => { for (const f of fl) if (f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf")) S.newFiles.push(f); renderNewFiles(); };
+  nfi.onchange = () => { addFiles(nfi.files); nfi.value = ""; };
+  ndz.ondragover = (e) => { e.preventDefault(); ndz.classList.add("drag"); };
+  ndz.ondragleave = () => ndz.classList.remove("drag");
+  ndz.ondrop = (e) => { e.preventDefault(); ndz.classList.remove("drag"); addFiles(e.dataTransfer.files); };
   $("#cancel-new").onclick = () => $("#new-app-dialog").close();
   $("#new-app-form").onsubmit = createApp;
   await loadApps();
@@ -51,12 +57,21 @@ async function createApp(ev) {
   const f = ev.target; const body = {};
   for (const el of f.elements) if (el.name) body[el.name] = ["loan_amount", "tenure_months", "interest_rate", "business_vintage_years", "declared_existing_emi"].includes(el.name) ? Number(el.value || 0) : el.value;
   try {
+    $("#create-btn").disabled = true;
     const a = await api("/api/applications", { method: "POST", body: JSON.stringify(body) });
-    if (f.dataset.slug) a._slug = f.dataset.slug;
-    S.demoSlug = { ...(S.demoSlug || {}), [a.id]: f.dataset.slug };
+    if (S.newFiles.length) {
+      const fd = new FormData(); S.newFiles.forEach((x) => fd.append("files", x));
+      await api(`/api/applications/${a.id}/documents`, { method: "POST", body: fd });
+    }
     $("#new-app-dialog").close();
+    S.tab = "live"; S.forceTab = "live";
     await loadApps(); openApp(a.id);
   } catch (e) { toast(e.message, true); }
+  $("#create-btn").disabled = false;
+}
+function renderNewFiles() {
+  $("#new-file-list").innerHTML = (S.newFiles || []).map((f, i) => `<span class="chip">📄 ${esc(f.name)} <span class="muted">${(f.size / 1024).toFixed(0)} KB</span><button type="button" onclick="S.newFiles.splice(${i},1);renderNewFiles()">✕</button></span>`).join("");
+  $("#create-btn").textContent = S.newFiles.length ? `Create & analyse ${S.newFiles.length} document${S.newFiles.length > 1 ? "s" : ""}` : "Create application";
 }
 
 async function loadApps() {
@@ -69,7 +84,7 @@ async function loadApps() {
         ${a.risk_grade ? `<span class="pill grey">Grade ${esc(a.risk_grade)}</span>` : ""}
         ${a.recommendation ? `<span class="pill ${recClass(a.recommendation)}">${esc(REC_LABEL[a.recommendation] || a.recommendation)}</span>` : ""}
         ${a.open_contradictions ? `<span class="pill high">${a.open_contradictions} flag${a.open_contradictions > 1 ? "s" : ""}</span>` : ""}
-        ${!a.readiness.ready ? `<span class="pill warn">${a.readiness.missing.length} doc${a.readiness.missing.length > 1 ? "s" : ""} missing</span>` : ""}
+        ${!a.readiness.ready && !a.readiness.items.some((i) => i.pending) ? `<span class="pill warn">${a.readiness.missing.length} doc${a.readiness.missing.length > 1 ? "s" : ""} missing</span>` : ""}
       </div>
     </div>`).join("") || `<div class="muted small">No applications yet.</div>`;
 }
@@ -85,22 +100,28 @@ async function openApp(id) {
   clearInterval(S.poll);
   const prevId = S.current?.application.id;
   S.current = await api(`/api/applications/${id}`);
-  if (prevId !== id) S.tab = "overview";
+  const processing = () => S.current.documents.some((d) => ["uploaded", "classifying", "extracting"].includes(d.status))
+    || ["documents", "crosscheck", "reasoning"].includes(S.current.application.live?.stage);
+  if (S.forceTab) { S.tab = S.forceTab; delete S.forceTab; }
+  else if (prevId !== id) S.tab = processing() || !latest() ? "live" : "assessment";
   render();
   loadApps();
-  const processing = () => S.current.documents.some((d) => ["uploaded", "classifying", "extracting"].includes(d.status));
   if (processing()) {
     S.poll = setInterval(async () => {
       if (S.current?.application.id !== id) return clearInterval(S.poll);
       S.current = await api(`/api/applications/${id}`);
-      if (!processing()) { clearInterval(S.poll); loadApps(); toast("Document processing complete"); }
-      render();
-    }, 2500);
+      if (!processing()) {
+        clearInterval(S.poll); loadApps();
+        const st = S.current.application.live?.stage;
+        toast(st === "done" ? "Credit Brain assessment ready" : st === "blocked" ? "Decision blocked - mandatory documents missing" : "Processing finished", st === "blocked" || st === "error");
+      }
+      if (S.tab === "live" || S.tab === "overview") render();
+    }, 1500);
   }
 }
 
 // ---------------------------------------------------------------- render
-const TABS = [["overview", "Overview & documents"], ["extraction", "AI extraction"], ["cashflow", "Cash-flow"], ["contradictions", "Contradictions"],
+const TABS = [["live", "Live analysis"], ["overview", "Documents"], ["extraction", "AI extraction"], ["cashflow", "Cash-flow"], ["contradictions", "Contradictions"],
   ["assessment", "Credit assessment"], ["trace", "Decision trace"], ["ask", "Ask Credit Brain"], ["audit", "Audit log"]];
 
 function latest() { const a = S.current.application.assessments || []; return a[a.length - 1]; }
@@ -120,12 +141,119 @@ function render() {
     </div>
     <div class="tabs">${TABS.map(([k, l]) => `<div class="tab ${S.tab === k ? "active" : ""}" onclick="setTab('${k}')">${l}</div>`).join("")}</div>
     <div id="tab-body"></div>`;
-  const fn = { overview: tabOverview, extraction: tabExtraction, cashflow: tabCashflow, contradictions: tabContradictions, assessment: tabAssessment, trace: tabTrace, ask: tabAsk, audit: tabAudit }[S.tab];
+  const fn = { live: tabLive, overview: tabOverview, extraction: tabExtraction, cashflow: tabCashflow, contradictions: tabContradictions, assessment: tabAssessment, trace: tabTrace, ask: tabAsk, audit: tabAudit }[S.tab];
   $("#tab-body").innerHTML = fn();
-  if (S.tab === "overview") wireUpload();
+  if (S.tab === "overview" || S.tab === "live") wireUpload();
   if (S.tab === "ask") { const c = $(".chat"); if (c) c.scrollTop = c.scrollHeight; }
 }
 function setTab(t) { S.tab = t; render(); }
+
+
+// ---------------------------------------------------------------- live analysis
+function fv(ext, k) { const f = ext?.fields?.[k]; return f && typeof f === "object" ? f.value : undefined; }
+function docFacts(d) {
+  const e = d.extraction; if (!e) return [];
+  const out = [];
+  const push = (l, v) => { if (v !== undefined && v !== null && v !== "") out.push([l, v]); };
+  if (d.doc_type === "bank_statement") {
+    push("Account holder", fv(e, "account_holder")); push("Bank", fv(e, "bank_name"));
+    const months = new Set((e.rows || []).map((r) => String(r.date).slice(0, 7)).filter((m) => /^\d{4}-\d{2}$/.test(m)));
+    push("Transactions read", (e.rows || []).length); push("Months covered", months.size);
+    push("Bounces spotted", (e.rows || []).filter((r) => r.category === "bounce_return").length);
+    push("Reconciles to balance", `${e.reconciliation?.pct ?? 0}%`);
+  } else if (d.doc_type === "itr") {
+    push("Taxpayer", fv(e, "taxpayer_name")); push("PAN", fv(e, "pan"));
+    push("Turnover", fv(e, "gross_receipts") != null ? lakh(fv(e, "gross_receipts")) : undefined);
+    push("Net profit", fv(e, "net_profit") != null ? lakh(fv(e, "net_profit")) : undefined);
+    push("Financial year", fv(e, "financial_year")); push("Tax paid", fv(e, "tax_paid") != null ? inr(fv(e, "tax_paid")) : undefined);
+  } else if (d.doc_type === "gst_return") {
+    push("GSTIN", fv(e, "gstin")); push("Trade name", fv(e, "trade_name"));
+    const ps = e.periods || [];
+    push("Periods filed", ps.length);
+    push("Declared turnover", ps.length ? lakh(ps.reduce((a, p) => a + Number(p.taxable_value || 0), 0)) : undefined);
+  }
+  const f = Object.values(e.fields || {}).filter((x) => x && typeof x === "object" && x.value != null);
+  if (f.length) push("Evidence verified", `${f.filter((x) => x.verified).length}/${f.length}`);
+  return out;
+}
+function docCard(d) {
+  const st = d.status;
+  const fin = ["extracted", "unused"].includes(st);
+  const states = [
+    "done",
+    fin || st === "extracting" ? "done" : st === "error" && !d.classification ? "fail" : "run",
+    fin ? "done" : st === "extracting" ? "run" : st === "error" && d.classification ? "fail" : "",
+    st === "extracted" ? "done" : "",
+  ];
+  const step = (i, label, sub = "") => {
+    const cls = states[i];
+    return `<li class="${cls}"><span class="ic">${cls === "done" ? "✓" : cls === "fail" ? "!" : cls === "run" ? '<span class="spinner" style="width:9px;height:9px"></span>' : ""}</span><div>${label}${sub ? `<div class="small muted">${sub}</div>` : ""}</div></li>`;
+  };
+  const p = d.progress || {};
+  const extractSub = st === "extracting" && d.doc_type === "bank_statement" && p.pages_total
+    ? `Page ${p.pages_done}/${p.pages_total} · ${p.rows} transactions read<div class="progress"><i style="width:${Math.max(6, (p.pages_done / p.pages_total) * 100)}%"></i></div>`
+    : st === "extracting" ? `<div class="progress"><i class="pulse" style="width:60%"></i></div>` : "";
+  const typeSub = d.classification ? `${Math.round(d.classification.confidence * 100)}% confident · ${esc(d.classification.reason)}` : "";
+  const cls = st === "error" ? "err" : ["extracted", "unused"].includes(st) ? "done" : "active";
+  const facts = docFacts(d);
+  return `<div class="doc-live ${cls}">
+    <div class="flex between"><span class="fname">📄 ${esc(d.filename)}</span>${d.doc_type !== "other" || d.classification ? `<span class="pill ${d.doc_type === "other" ? "grey" : "ai"}">${DOC_LABEL[d.doc_type]}</span>` : ""}</div>
+    <ul class="steps">
+      ${step(0, `PDF read · ${d.n_pages} page${d.n_pages > 1 ? "s" : ""}`)}
+      ${step(1, states[1] === "done" ? `AI identified: <b>${DOC_LABEL[d.doc_type]}</b>` : "AI identifying document type", typeSub)}
+      ${step(2, "AI extracting figures with evidence", extractSub)}
+      ${step(3, "Verified against the PDF")}
+    </ul>
+    ${d.error ? `<div class="small" style="color:var(--bad);margin-top:6px">${esc(d.error)}</div>` : ""}
+    ${facts.length ? `<div class="facts">${facts.map(([l, v]) => `<div class="fact"><div class="l">${esc(l)}</div><div class="v">${esc(v)}</div></div>`).join("")}</div>` : ""}
+  </div>`;
+}
+function tabLive() {
+  const { documents: docs, readiness: r, application: a } = S.current;
+  const live = a.live || {}; const L = latest();
+  const busyDocs = docs.some((d) => ["uploaded", "classifying", "extracting"].includes(d.status));
+  const stage = live.stage || (L ? "done" : busyDocs ? "documents" : "idle");
+  const analysis = stage === "reasoning" ? live.analysis : (stage === "done" && L ? L.analysis : null);
+  const S_ = (name) => {
+    const seq = ["documents", "crosscheck", "reasoning", "done"];
+    const cur = seq.indexOf(stage), me = seq.indexOf(name);
+    if (stage === "blocked" && name !== "documents") return "";
+    if (stage === "blocked" && name === "documents") return "fail";
+    if (stage === "error" && name === "reasoning") return "fail";
+    return cur > me ? "done" : cur === me ? "run" : "";
+  };
+  const ic = (cls, n) => `<div class="stage-ic ${cls}">${cls === "done" ? "✓" : cls === "fail" ? "!" : cls === "run" ? '<span class="spinner"></span>' : n}</div>`;
+  const contra = analysis ? analysis.contradictions : [];
+  const flagged = contra.filter((c) => c.severity !== "ok");
+  const pol = analysis?.policy;
+  const verdict = stage === "done" && L ? `
+    <div class="verdict"><div class="grade ${esc(L.memo.risk_grade)}">${esc(L.memo.risk_grade)}</div>
+      <div style="flex:1"><div class="small muted">Credit Brain recommendation${L.gate.gate_applied ? " (after policy gate)" : ""}</div>
+        <div class="rec ${L.gate.system_recommendation}">${esc(REC_LABEL[L.gate.system_recommendation])}</div>
+        <div style="margin-top:4px">${esc(L.memo.headline || "")}</div>
+        ${L.gate.gate_applied ? `<div class="small" style="color:var(--warn);margin-top:4px">AI suggested ${esc(REC_LABEL[L.memo.recommendation] || L.memo.recommendation)}, capped by policy gate</div>` : ""}</div>
+      <div class="flex" style="flex-direction:column;align-items:stretch"><button class="btn primary" onclick="setTab('assessment')">Full assessment →</button><button class="btn" onclick="setTab('trace')">Decision trace</button><button class="btn" onclick="setTab('ask')">Ask Credit Brain</button></div></div>` : "";
+  return `
+  ${verdict}
+  <div class="card" style="margin-top:${verdict ? "16px" : "0"}"><div class="flex between"><h2>Documents</h2>
+    <span class="small muted">${docs.filter((d) => d.status === "extracted").length}/${docs.length} processed</span></div>
+    ${docs.length ? `<div class="live-grid">${docs.map(docCard).join("")}</div>` : ""}
+    ${!docs.length || stage === "blocked" ? `<div class="dropzone" id="dropzone" style="margin-top:12px">${stage === "blocked" ? `<b>Missing: ${r.missing.map((m) => DOC_LABEL[m]).join(", ")}</b>. ` : ""}Drop PDFs here or <label class="browse">browse<input type="file" id="file-input" accept="application/pdf" multiple hidden></label></div>` : ""}
+  </div>
+  <div class="card"><h2>Credit Brain pipeline</h2>
+    <div class="stage-row">${ic(S_("documents"), 1)}<div><b>Mandatory documents</b>
+      <div class="checklist" style="margin-top:6px">${r.items.map((i) => `<div class="check ${i.present ? "ok" : i.pending ? "pending" : "missing"}">${i.present ? "✓" : i.pending ? '<span class="spinner"></span>' : "✕"} ${DOC_LABEL[i.doc_type]}</div>`).join("")}</div>
+      ${stage === "blocked" ? `<div class="small" style="color:var(--bad);margin-top:6px">Decision blocked and logged: upload the missing document above and the analysis resumes automatically.</div>` : ""}</div></div>
+    <div class="stage-row">${ic(S_("crosscheck"), 2)}<div><b>Cross-document checks</b>
+      <div class="small" style="margin-top:4px">${analysis ? (flagged.length ? flagged.map((c) => `<span class="pill ${c.severity}">${esc(c.title)}${c.variance_pct != null ? ` ${c.variance_pct > 0 ? "+" : ""}${c.variance_pct}%` : ""}</span>`).join(" ") : `<span class="pill ok">All documents consistent</span>`) : S_("crosscheck") === "run" ? `<span class="pulse">Comparing GST, ITR and bank figures...</span>` : `<span class="muted">Waiting for documents</span>`}</div></div></div>
+    <div class="stage-row">${ic(analysis ? (pol.summary.fail ? "fail" : pol.summary.warn ? "warn" : "done") : "", 3)}<div><b>Credit policy</b>
+      <div class="small" style="margin-top:4px">${pol ? pol.rules.map((x) => `<span class="pill ${x.status}">${esc(x.name.split(" (")[0])}: ${fmtRule(x)}</span>`).join(" ") + `<div class="muted" style="margin-top:4px">Proposed EMI ${inr(pol.proposed_emi)} · existing EMIs ${inr(pol.existing_emi_used)}</div>` : `<span class="muted">Waiting</span>`}</div></div></div>
+    <div class="stage-row">${ic(S_("reasoning"), 4)}<div><b>Credit Brain reasoning (LLM)</b>
+      <div class="small" style="margin-top:4px">${stage === "reasoning" ? `<span class="pulse">Weighing evidence and writing the credit memo...</span>` : stage === "done" && L ? `Grade ${esc(L.memo.risk_grade)} · confidence ${Math.round((L.memo.confidence || 0) * 100)}% · ${L.grounding.citations - L.grounding.unresolved}/${L.grounding.citations} citations grounded · ${esc(L.llm.model)} in ${(L.llm.latency_ms / 1000).toFixed(1)}s` : stage === "error" ? `<span style="color:var(--bad)">${esc(live.message || "Failed")}</span> <button class="btn small" onclick="runAssessment()">Retry</button>` : `<span class="muted">Waiting</span>`}</div></div></div>
+  </div>
+  ${stage === "done" && L ? `<div class="grid2"><div class="card"><h3 style="color:var(--ok)">Strengths</h3><ul class="clean">${(L.memo.strengths || []).map((x) => `<li>${esc(x.point)}</li>`).join("")}</ul></div>
+    <div class="card"><h3 style="color:var(--bad)">Risks</h3><ul class="clean">${(L.memo.risks || []).map((x) => `<li><span class="pill ${esc(x.severity)}">${esc(x.severity)}</span> ${esc(x.point)}</li>`).join("")}</ul></div></div>` : ""}`;
+}
 
 // ---------------------------------------------------------------- overview
 function statusPill(d) {
@@ -135,7 +263,6 @@ function statusPill(d) {
 }
 function tabOverview() {
   const { documents: docs, readiness: r, application: a } = S.current;
-  const slug = (S.demoSlug || {})[a.id] || guessSlug(a);
   return `
   <div class="card">
     <div class="flex between"><h2>Document readiness</h2>
@@ -148,9 +275,6 @@ function tabOverview() {
     <h2>Documents</h2>
     <div class="dropzone" id="dropzone">Drop PDF files here or <label style="display:inline;color:var(--brand);cursor:pointer">browse<input type="file" id="file-input" accept="application/pdf" multiple hidden></label>
       <div class="small" style="margin-top:6px">Credit Brain identifies each document type automatically - no need to label files.</div></div>
-    ${slug ? `<div class="flex" style="margin-top:10px"><span class="small muted">Synthetic sample files for this case:</span>
-      ${["bank_statement", "itr", "gst_returns"].map((t) => `<button class="btn small" onclick="uploadSample('${slug}_${t}.pdf')">+ ${t.replace("_", " ")}</button>`).join("")}
-      <button class="btn small" onclick="uploadSample(null,'${slug}')">+ all three</button></div>` : ""}
     <table style="margin-top:14px"><thead><tr><th>File</th><th>Type (AI-detected)</th><th>Status</th><th>Quality</th><th></th></tr></thead><tbody>
     ${docs.map((d) => `<tr>
       <td><a href="/api/documents/${d.id}/file" target="_blank">${esc(d.filename)}</a><div class="small muted">${d.n_pages} page(s)</div></td>
@@ -162,7 +286,6 @@ function tabOverview() {
     </tbody></table>
   </div>`;
 }
-function guessSlug(a) { const n = (a.business_name || "").toLowerCase(); return n.includes("arvind") ? "arvind_textiles" : n.includes("lakshmi") ? "sri_lakshmi_traders" : n.includes("bluepeak") ? "bluepeak_logistics" : null; }
 function docQuality(d) {
   const e = d.extraction; if (!e) return "";
   const f = Object.values(e.fields || {}).filter((x) => x && typeof x === "object");
@@ -185,11 +308,6 @@ async function uploadFiles(files) {
   const fd = new FormData(); files.forEach((f) => fd.append("files", f));
   try { await api(`/api/applications/${S.current.application.id}/documents`, { method: "POST", body: fd }); toast(`Uploaded ${files.length} file(s) - AI is reading them`); openApp(S.current.application.id); }
   catch (e) { toast(e.message, true); }
-}
-async function uploadSample(name, slug) {
-  const names = name ? [name] : ["bank_statement", "itr", "gst_returns"].map((t) => `${slug}_${t}.pdf`);
-  const files = await Promise.all(names.map(async (n) => new File([await (await fetch(`/api/demo/sample/${n}`)).blob()], n, { type: "application/pdf" })));
-  uploadFiles(files);
 }
 async function setDocType(id, t) { await api(`/api/documents/${id}`, { method: "PATCH", body: JSON.stringify({ doc_type: t }) }); openApp(S.current.application.id); }
 async function deleteDoc(id) { await api(`/api/documents/${id}`, { method: "DELETE" }); openApp(S.current.application.id); }

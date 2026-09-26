@@ -45,14 +45,13 @@ The LLM provider is chosen from whichever key is set: `GEMINI_API_KEY`, `ANTHROP
 You can override it with `LLM_PROVIDER` and `LLM_MODEL`.
 
 ### Demo flow (7 minutes)
-1. **+ New application**, then prefill *Sri Lakshmi Traders (synthetic)*, then Create.
-2. Upload only the bank statement and GST returns, then click **Run Credit Brain assessment**. The decision is **blocked** because the ITR is missing, and the attempt is audited.
-3. Upload the ITR. Credit Brain classifies and extracts it live.
-4. **AI extraction** tab: evidence quotes, "verified in PDF" badges, transactions classified by AI, and the reconciliation check.
-5. Run the assessment. Show **Contradictions** (GST vs bank +28%), the **Credit assessment** and the **Decision trace**.
+1. Click **+ New application**. Fill in the loan details, or prefill a synthetic case, then drop the borrower's PDFs into the same form and click **Create & analyse**.
+2. The **Live analysis** screen opens. For each document you see it read, identified by AI, extracted page by page (transactions counted live), and verified against the PDF, with key figures appearing as they're found.
+3. Once every document is in, the pipeline continues on its own: mandatory-document check, cross-document contradictions, credit policy, and Credit Brain reasoning. It finishes with the recommendation card.
+4. **Blocked-decision demo:** create *Sri Lakshmi Traders* with only the bank statement and GST returns. The pipeline stops at "Mandatory documents", and the block is audited. Drop the ITR onto the live screen and the analysis resumes automatically.
+5. Drill in with **AI extraction** (evidence, verified badges, AI-classified transactions), **Contradictions**, **Credit assessment**, and **Decision trace**.
 6. **Ask Credit Brain**: "What loan amount keeps FOIR under 60%?"
-7. Record an officer decision. An override without a justification is rejected. Then show the **Audit log**.
-8. Contrast with *Arvind Textiles* (clean case) and *BluePeak Logistics* (critical contradictions, bounces and a fresh NBFC loan).
+7. Record the officer decision. An override without a justification is rejected. Then show the **Audit log**.
 
 ### Synthetic data
 `scripts/generate_synthetic_docs.py` generates the PDFs in `sample_docs/`: 3 fictitious borrowers, each with a

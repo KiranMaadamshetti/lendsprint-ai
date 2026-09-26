@@ -46,6 +46,7 @@ class NewApplication(BaseModel):
     interest_rate: float = Field(gt=0, lt=40)
     purpose: str = ""
     declared_existing_emi: float = 0
+    auto_assess: bool = True
 
 
 class DocTypeUpdate(BaseModel):
@@ -127,8 +128,8 @@ def _process(doc_id, actor, classify=True):
             d = db.update("documents", doc_id, doc_type=c["doc_type"], type_source="ai", classification=c)
             db.audit(d["app_id"], "Credit Brain (AI)", "Document classified",
                      {"file": d["filename"], "doc_type": c["doc_type"], "confidence": c["confidence"], "reason": c["reason"]})
-        db.update("documents", doc_id, status="extracting")
-        ext = extraction.run_extraction(d["doc_type"], pages)
+        db.update("documents", doc_id, status="extracting", progress={"pages_done": 0, "pages_total": len(pages), "rows": 0})
+        ext = extraction.run_extraction(d["doc_type"], pages, progress=lambda p: db.update("documents", doc_id, progress=p))
         d = db.update("documents", doc_id, extraction=ext, status="extracted" if d["doc_type"] != "other" else "unused")
         detail = {"file": d["filename"], "doc_type": d["doc_type"], "model": ext.get("model"), "latency_ms": ext.get("latency_ms")}
         if d["doc_type"] == "bank_statement":
@@ -140,6 +141,30 @@ def _process(doc_id, actor, classify=True):
         traceback.print_exc()
         db.update("documents", doc_id, status="error", error=str(e)[:500])
         db.audit(d["app_id"], "System", "Extraction failed", {"file": d.get("filename"), "error": str(e)[:300]})
+    _maybe_auto_assess(d["app_id"])
+
+
+_assess_locks: dict[str, threading.Lock] = {}
+_locks_guard = threading.Lock()
+
+
+def _set_live(aid, stage, **extra):
+    db.update("applications", aid, live={"stage": stage, "ts": db.now(), **extra})
+
+
+def _maybe_auto_assess(aid):
+    """When every uploaded document has finished processing, run the assessment automatically."""
+    a = db.get("applications", aid)
+    if not a or not a.get("auto_assess", True):
+        return
+    docs = db.list_docs(aid)
+    if not docs or any(x.get("status") in ("uploaded", "classifying", "extracting") for x in docs):
+        return
+    try:
+        run_assessment(aid, "Credit Brain (auto)")
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        _set_live(aid, "error", message=str(e)[:300])
 
 
 @app.post("/api/applications/{aid}/documents")
@@ -147,7 +172,8 @@ async def upload_documents(aid: str, files: list[UploadFile] = File(...), x_acto
     _app_or_404(aid)
     if not llm.status()["configured"]:
         raise HTTPException(503, "No LLM API key configured - AI extraction is unavailable. Add a key to .env and restart.")
-    created = []
+    _set_live(aid, "documents")
+    created, to_process = [], []
     for f in files:
         raw = await f.read()
         if not raw[:5] == b"%PDF-":
@@ -164,8 +190,13 @@ async def upload_documents(aid: str, files: list[UploadFile] = File(...), x_acto
         db.put("documents", doc_id, doc, aid)
         db.audit(aid, actor_of(x_actor), "Document uploaded", {"file": f.filename, "pages": len(pages)})
         if doc["status"] != "error":
-            threading.Thread(target=_process, args=(doc_id, actor_of(x_actor)), daemon=True).start()
+            to_process.append(doc_id)
         created.append(_public_doc(doc))
+    # start AI processing only after every file is registered, so auto-assessment waits for all of them
+    for doc_id in to_process:
+        threading.Thread(target=_process, args=(doc_id, actor_of(x_actor)), daemon=True).start()
+    if not to_process:
+        _maybe_auto_assess(aid)
     return created
 
 
@@ -210,31 +241,65 @@ def doc_text(doc_id: str):
 
 
 # ---- assessment ----------------------------------------------------------------------
+class Blocked(Exception):
+    def __init__(self, missing):
+        self.missing = missing
+
+
+def run_assessment(aid, actor):
+    with _locks_guard:
+        lock = _assess_locks.setdefault(aid, threading.Lock())
+    if not lock.acquire(blocking=False):
+        return None  # an assessment for this application is already running
+    try:
+        a = db.get("applications", aid)
+        docs = db.list_docs(aid)
+        ready = an.readiness(docs)
+        if not ready["ready"]:
+            db.audit(aid, actor, "Decision blocked", {"missing": ready["missing"]})
+            db.update("applications", aid, status="Documents pending")
+            _set_live(aid, "blocked", missing=ready["missing"])
+            raise Blocked(ready["missing"])
+        _set_live(aid, "crosscheck")
+        result = an.analyse(a, docs)
+        _set_live(aid, "reasoning", analysis=result)
+        ctx = brain.case_context(a, docs, result)
+        memo, meta = brain.credit_memo(a, docs, result)
+        grounding = brain.ground_check(memo, result, ctx)
+        g = brain.gate(memo.get("recommendation"), result)
+        a = db.get("applications", aid)
+        version = len(a.get("assessments") or []) + 1
+        record = {"version": version, "ts": db.now(), "by": actor, "analysis": result, "memo": memo, "gate": g,
+                  "grounding": grounding, "llm": {"model": meta["model"], "latency_ms": meta["latency_ms"], "usage": meta.get("usage")}}
+        a["assessments"] = (a.get("assessments") or []) + [record]
+        a["status"] = "Assessed"
+        a["live"] = {"stage": "done", "ts": db.now()}
+        db.put("applications", aid, a)
+        db.audit(aid, "Credit Brain (AI)", "Assessment generated",
+                 {"version": version, "ai_recommendation": memo.get("recommendation"), "system_recommendation": g["system_recommendation"],
+                  "risk_grade": memo.get("risk_grade"), "gate_applied": g["gate_applied"], "model": meta["model"], "triggered_by": actor})
+        return record
+    except Blocked:
+        raise
+    except Exception as e:
+        _set_live(aid, "error", message=str(e)[:300])
+        raise
+    finally:
+        lock.release()
+
+
 @app.post("/api/applications/{aid}/assess")
 def assess(aid: str, x_actor: str | None = Header(None)):
-    a = _app_or_404(aid)
+    _app_or_404(aid)
     docs = db.list_docs(aid)
-    ready = an.readiness(docs)
     if any(d.get("status") in ("uploaded", "classifying", "extracting") for d in docs):
         raise HTTPException(409, "Documents are still being processed - try again in a few seconds.")
-    if not ready["ready"]:
-        db.audit(aid, actor_of(x_actor), "Decision blocked", {"missing": ready["missing"]})
-        db.update("applications", aid, status="Documents pending")
-        return JSONResponse(status_code=400, content={"detail": "Mandatory documents missing", "missing": ready["missing"]})
-    result = an.analyse(a, docs)
-    ctx = brain.case_context(a, docs, result)
-    memo, meta = brain.credit_memo(a, docs, result)
-    grounding = brain.ground_check(memo, result, ctx)
-    g = brain.gate(memo.get("recommendation"), result)
-    version = len(a.get("assessments") or []) + 1
-    record = {"version": version, "ts": db.now(), "by": actor_of(x_actor), "analysis": result, "memo": memo, "gate": g,
-              "grounding": grounding, "llm": {"model": meta["model"], "latency_ms": meta["latency_ms"], "usage": meta.get("usage")}}
-    a["assessments"] = (a.get("assessments") or []) + [record]
-    a["status"] = "Assessed"
-    db.put("applications", aid, a)
-    db.audit(aid, "Credit Brain (AI)", "Assessment generated",
-             {"version": version, "ai_recommendation": memo.get("recommendation"), "system_recommendation": g["system_recommendation"],
-              "risk_grade": memo.get("risk_grade"), "gate_applied": g["gate_applied"], "model": meta["model"]})
+    try:
+        record = run_assessment(aid, actor_of(x_actor))
+    except Blocked as b:
+        return JSONResponse(status_code=400, content={"detail": "Mandatory documents missing", "missing": b.missing})
+    if record is None:
+        raise HTTPException(409, "An assessment is already running for this application.")
     return record
 
 

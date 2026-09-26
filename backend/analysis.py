@@ -44,7 +44,8 @@ def _month(d):
 def readiness(docs):
     present = {d["doc_type"] for d in docs if d.get("status") == "extracted"}
     pending = {d["doc_type"] for d in docs if d.get("status") in ("uploaded", "extracting")}
-    items = [{"doc_type": t, "present": t in present, "pending": t in pending and t not in present} for t in MANDATORY_DOCS]
+    unidentified = any(d.get("status") in ("uploaded", "classifying") for d in docs)  # type not known yet
+    items = [{"doc_type": t, "present": t in present, "pending": t not in present and (t in pending or unidentified)} for t in MANDATORY_DOCS]
     missing = [i["doc_type"] for i in items if not i["present"]]
     return {"items": items, "missing": missing, "ready": not missing}
 
