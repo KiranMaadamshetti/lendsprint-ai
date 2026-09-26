@@ -149,7 +149,7 @@ def _bank_page(page_text, first):
     out, meta = llm.chat_json(
         "You are a bank-statement analyst in an Indian lender's credit team. You transcribe transactions exactly and "
         "classify each one by reading its narration the way an experienced underwriter would.",
-        f"""Transcribe EVERY transaction row on this bank-statement page, in order, as compact arrays:
+        f"""Transcribe EVERY transaction row on these bank-statement page(s), in order, as compact arrays:
 ["YYYY-MM-DD", "narration (verbatim)", debit_amount, credit_amount, balance_after, "category", "counterparty"]
 - Amounts are plain numbers in rupees; use 0 when the column is empty. Balance is the balance column on that row.
 - category for credits: {", ".join(CREDIT_CATEGORIES)}
@@ -168,16 +168,19 @@ PAGE TEXT:
 
 
 def extract_bank(pages, progress=None):
-    results = [None] * len(pages)
+    # group pages (3 per call) to save LLM calls / rate-limit quota; page markers stay in the text
+    size = int(__import__("os").getenv("BANK_PAGES_PER_CALL", "3"))
+    groups = ["\n\n".join(pages[i:i + size]) for i in range(0, len(pages), size)]
+    results = [None] * len(groups)
     with ThreadPoolExecutor(max_workers=6) as ex:
-        futs = {ex.submit(_bank_page, p, i == 0): i for i, p in enumerate(pages)}
+        futs = {ex.submit(_bank_page, p, i == 0): i for i, p in enumerate(groups)}
         done = rows_so_far = 0
         for fut in as_completed(futs):
             results[futs[fut]] = fut.result()
             done += 1
             rows_so_far += len(results[futs[fut]][0].get("rows", []) or [])
             if progress:
-                progress({"pages_done": done, "pages_total": len(pages), "rows": rows_so_far})
+                progress({"pages_done": min(len(pages), done * size), "pages_total": len(pages), "rows": rows_so_far})
     fields, rows, latency, model = {}, [], 0, None
     for i, (out, meta) in enumerate(results):
         if i == 0:
@@ -186,7 +189,7 @@ def extract_bank(pages, progress=None):
             if isinstance(r, list) and len(r) >= 6:
                 rows.append({"date": r[0], "narration": r[1], "debit": _num(r[2]), "credit": _num(r[3]),
                              "balance": _num(r[4]), "category": r[5], "counterparty": r[6] if len(r) > 6 else "",
-                             "page": i + 1})
+                             "page": i * size + 1})
         latency = max(latency, meta["latency_ms"])
         model = meta["model"]
     return {"fields": fields, "rows": rows, "reconciliation": reconcile(rows), "model": model, "latency_ms": latency}

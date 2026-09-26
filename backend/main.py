@@ -28,7 +28,7 @@ from . import brain, db, extraction, llm, pdftext  # noqa: E402
 
 db.init()
 app = FastAPI(title="LendSprint - AI Credit Underwriting Copilot")
-BUILD = "2026-09-26.4"
+BUILD = "2026-09-26.5"
 
 
 def actor_of(x_actor):
@@ -68,6 +68,16 @@ class ChatIn(BaseModel):
 @app.get("/api/health")
 def health():
     return {"ok": True, "build": BUILD, "llm": llm.status()}
+
+
+@app.get("/api/llm/models")
+def llm_models():
+    if llm.provider() != "gemini":
+        return {"provider": llm.provider(), "models": []}
+    try:
+        return {"provider": "gemini", "current": llm.model_name(), "bad": sorted(llm._bad_models), "models": llm.list_gemini_models()}
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)[:300]}
 
 
 @app.get("/api/policy")
@@ -404,12 +414,24 @@ def demo_cases():
     return [{"slug": s, **c} for s, c in DEMO_CASES]
 
 
-@app.get("/api/demo/sample/{name}")
+@app.get("/api/demo/samples")
+def sample_list():
+    base = os.path.join(ROOT, "sample_docs")
+    out = []
+    for root, _, files in os.walk(base):
+        for f in sorted(files):
+            out.append(os.path.relpath(os.path.join(root, f), base).replace(os.sep, "/"))
+    return sorted(out)
+
+
+@app.get("/api/demo/sample/{name:path}")
 def sample_file(name: str):
-    path = os.path.join(ROOT, "sample_docs", os.path.basename(name))
+    parts = [p for p in name.replace("\\", "/").split("/") if p not in ("", ".", "..")]
+    path = os.path.join(ROOT, "sample_docs", *parts)
     if not os.path.exists(path):
         raise HTTPException(404)
-    return FileResponse(path, media_type="application/pdf", filename=os.path.basename(name))
+    mime = "application/pdf" if path.lower().endswith(".pdf") else "image/jpeg"
+    return FileResponse(path, media_type=mime, filename=os.path.basename(path))
 
 
 app.mount("/", StaticFiles(directory=os.path.join(ROOT, "frontend"), html=True), name="ui")

@@ -98,24 +98,63 @@ def status() -> dict:
     return {"configured": bool(p), "provider": p, "model": model_name()}
 
 
+class QuotaExhausted(LLMError):
+    pass
+
+
+def _quota_info(text):
+    """Pull the quota id and suggested retry delay out of a Google 429 body."""
+    ids = re.findall(r'"quotaId":\s*"([^"]+)"', text)
+    delay = re.search(r'"retryDelay":\s*"(\d+(?:\.\d+)?)s"', text)
+    daily = any("PerDay" in q for q in ids) or "per day" in text.lower()
+    return ids, float(delay.group(1)) if delay else None, daily
+
+
 def _post(url, headers, payload, timeout=240):
     last = None
-    for attempt in range(6):
+    for attempt in range(7):
         try:
             with _sem:
                 r = httpx.post(url, headers=headers, json=payload, timeout=timeout)
-            if r.status_code in (429, 500, 502, 503, 529):
+            if r.status_code == 429:
+                ids, delay, daily = _quota_info(r.text)
+                msg = f"429 quota exceeded ({', '.join(ids) or 'rate limit'})"
+                if daily or "limit: 0" in r.text:
+                    raise QuotaExhausted(msg + " - daily / zero quota for this model", 429)
+                last = LLMError(msg, 429)
+                time.sleep(min(65, delay + 1 if delay else 4 * 2 ** attempt))
+                continue
+            if r.status_code in (500, 502, 503, 529):
                 last = LLMError(f"{r.status_code}: {r.text[:300]}", r.status_code)
-                wait = float(r.headers.get("retry-after") or 0) or min(40, 3 * 2 ** attempt)
-                time.sleep(wait)
+                time.sleep(min(30, 3 * 2 ** attempt))
                 continue
             if r.status_code >= 400:
-                raise LLMError(f"{r.status_code}: {r.text[:500]}", r.status_code)
+                raise LLMError(f"{r.status_code}: {r.text[:800]}", r.status_code)
             return r.json()
         except httpx.HTTPError as e:
             last = LLMError(str(e))
             time.sleep(min(20, 2 * (attempt + 1)))
     raise last
+
+
+def list_gemini_models():
+    key = os.getenv(KEY_VARS["gemini"])
+    r = httpx.get(f"{GEMINI_BASE}/models?pageSize=200", headers={"x-goog-api-key": key}, timeout=30)
+    r.raise_for_status()
+    return [m["name"].removeprefix("models/") for m in r.json().get("models", []) if "generateContent" in m.get("supportedGenerationMethods", [])]
+
+
+def _next_gemini_model(key):
+    """After a quota wall on one model, try the next-best flash / flash-lite model this key can use."""
+    try:
+        names = [n for n in list_gemini_models() if n not in _bad_models]
+    except Exception:  # noqa: BLE001
+        return None
+    for pat in (r"gemini-[\d.]+-flash", r"gemini-[\d.]+-flash-lite", r"gemini-flash-latest", r"gemini-flash-lite-latest", r"gemini-[\d.]+-flash.*"):
+        cands = sorted([n for n in names if re.fullmatch(pat, n)], reverse=True)
+        if cands:
+            return cands[0]
+    return None
 
 
 def _gemini_parts(content):
@@ -177,12 +216,21 @@ def chat(system: str, messages: list[dict], max_tokens: int = 4000, json_mode: b
         if json_mode:
             cfg["responseMimeType"] = "application/json"
         body = {"systemInstruction": {"parts": [{"text": system}]}, "contents": contents, "generationConfig": cfg}
-        for _ in range(3):
+        for _ in range(5):
             model = model_name()
             try:
                 data = _post(f"{GEMINI_BASE}/models/{model}:generateContent",
                              {"content-type": "application/json", "x-goog-api-key": key}, body)
                 break
+            except QuotaExhausted:
+                _bad_models.add(model)
+                nxt = _next_gemini_model(key) if not os.getenv("LLM_MODEL_LOCK") else None
+                if not nxt:
+                    raise QuotaExhausted("Gemini quota exhausted for this API key (free tier). Enable billing in Google AI Studio "
+                                         "or add a different key in .env, then restart.", 429)
+                with _resolve_lock:
+                    _resolved["gemini"] = nxt
+                continue
             except LLMError as e:
                 if e.status == 404:
                     # retired / unavailable model: use the replacement Google names in the error, else rediscover
