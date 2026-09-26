@@ -43,8 +43,8 @@ def _month(d):
 # ---------------------------------------------------------------------------------------
 def readiness(docs):
     present = {d["doc_type"] for d in docs if d.get("status") == "extracted"}
-    pending = {d["doc_type"] for d in docs if d.get("status") in ("uploaded", "extracting")}
-    unidentified = any(d.get("status") in ("uploaded", "classifying") for d in docs)  # type not known yet
+    pending = {d["doc_type"] for d in docs if d.get("status") in ("uploaded", "ocr", "extracting")}
+    unidentified = any(d.get("status") in ("uploaded", "ocr", "classifying") for d in docs)  # type not known yet
     items = [{"doc_type": t, "present": t in present, "pending": t not in present and (t in pending or unidentified)} for t in MANDATORY_DOCS]
     missing = [i["doc_type"] for i in items if not i["present"]]
     return {"items": items, "missing": missing, "ready": not missing}
@@ -106,8 +106,19 @@ def _severity(v):
     return None
 
 
-def contradictions(app, bank, bm, itr, gst):
+def contradictions(app, bank, bm, itr, gst, bureau=None):
     out = []
+    # 0. Bureau EMIs vs declared EMIs
+    b_emi = fval(bureau, "total_monthly_emi")
+    if b_emi:
+        declared = float(app.get("declared_existing_emi") or 0)
+        b_emi = float(b_emi)
+        if b_emi > declared * 1.10 + 1000:
+            v = (b_emi - declared) / declared if declared else 1.0
+            out.append({"id": "C-BUREAU", "title": "Declared EMIs vs EMIs on credit bureau", "severity": _severity(v) or "medium",
+                        "variance_pct": round(v * 100, 1), "lhs": {"label": "Bureau total EMI (active loans)", "value": b_emi},
+                        "rhs": {"label": "Declared in application", "value": declared},
+                        "explain": "The bureau shows obligations the borrower did not declare."})
     # 1. GST declared turnover vs bank business credits, same months only
     if bank and gst and bm["months"]:
         gst_by_m = {p.get("period"): float(p.get("taxable_value") or 0) for p in gst.get("periods", [])}
@@ -157,10 +168,11 @@ def contradictions(app, bank, bm, itr, gst):
     return out
 
 
-def policy(app, bm, itr, contra, recon_pct):
+def policy(app, bm, itr, contra, recon_pct, bureau=None):
     amount, rate, tenure = float(app["loan_amount"]), float(app["interest_rate"]), int(app["tenure_months"])
     new_emi = emi(amount, rate, tenure)
-    existing = max(float(app.get("declared_existing_emi") or 0), bm["observed_monthly_emi"] if bm else 0)
+    bureau_emi = float(fval(bureau, "total_monthly_emi") or 0)
+    existing = max(float(app.get("declared_existing_emi") or 0), bm["observed_monthly_emi"] if bm else 0, bureau_emi)
     np_ = fval(itr, "net_profit")
     rules = []
 
@@ -189,6 +201,15 @@ def policy(app, bm, itr, contra, recon_pct):
         ltt = amount / bm["annualised_business_credits"] if bm["annualised_business_credits"] else 9.99
         rule("P-LTT", "Loan amount / annual banking turnover", round(ltt, 3), f"<= {POLICY['loan_to_turnover_max']:.0%}",
              "pass" if ltt <= POLICY["loan_to_turnover_max"] else "fail", {"loan_amount": amount, "annual_turnover": bm["annualised_business_credits"]}, "pct")
+    score = fval(bureau, "credit_score")
+    if score:
+        try:
+            score = float(score)
+            dpd = float(fval(bureau, "max_dpd_last_12_months") or 0)
+            st = "fail" if score < 650 or dpd > 60 else ("warn" if score < 700 or dpd > 0 else "pass")
+            rule("P-BUREAU", "Bureau score / recent DPD", score, ">= 700 and no DPD", st, {"score": score, "max_dpd_12m": dpd}, "int")
+        except (TypeError, ValueError):
+            pass
     crit = [c["id"] for c in contra if c["severity"] == "critical"]
     high = [c["id"] for c in contra if c["severity"] == "high"]
     rule("P-INTEGRITY", "Cross-document data integrity", len(crit) + len(high), "no critical contradictions",
@@ -201,17 +222,42 @@ def policy(app, bm, itr, contra, recon_pct):
             "summary": {s: sum(1 for r in rules if r["status"] == s) for s in ("pass", "warn", "fail")}}
 
 
+def _combine(docs):
+    """Several statements / returns per borrower are normal: merge bank rows and GST periods, take the latest ITR."""
+    ext = {t: [d for d in docs if d.get("status") == "extracted" and d["doc_type"] == t and d.get("extraction")]
+           for t in MANDATORY_DOCS + ["bureau_report"]}
+    bank = None
+    if ext["bank_statement"]:
+        rows, checked, ok, breaks = [], 0, 0, []
+        for d in ext["bank_statement"]:
+            e = d["extraction"]
+            rows += [{**r, "source": d["filename"]} for r in e.get("rows", [])]
+            rc = e.get("reconciliation") or {}
+            checked += rc.get("rows_checked", 0); ok += rc.get("rows_reconciled", 0); breaks += rc.get("breaks", [])
+        rows.sort(key=lambda r: str(r.get("date")))
+        first = ext["bank_statement"][0]["extraction"]
+        bank = {"fields": first.get("fields", {}), "rows": rows, "accounts": len(ext["bank_statement"]),
+                "reconciliation": {"rows_checked": checked, "rows_reconciled": ok, "pct": round(100 * ok / checked, 1) if checked else 0.0, "breaks": breaks[:10]}}
+    gst = None
+    if ext["gst_return"]:
+        periods = {}
+        for d in ext["gst_return"]:
+            for p in d["extraction"].get("periods", []):
+                periods.setdefault(p.get("period"), p)
+        gst = {"fields": ext["gst_return"][0]["extraction"].get("fields", {}), "periods": [periods[k] for k in sorted(k for k in periods if k)]}
+    itr = None
+    if ext["itr"]:
+        itr = max((d["extraction"] for d in ext["itr"]), key=lambda e: str(fval(e, "assessment_year") or fval(e, "financial_year") or ""))
+    bureau = ext["bureau_report"][0]["extraction"] if ext["bureau_report"] else None
+    sources = {t: [d["id"] for d in v] for t, v in ext.items() if v}
+    return bank, itr, gst, bureau, sources
+
+
 def analyse(app, docs):
-    by_type = {}
-    for d in docs:
-        if d.get("status") == "extracted" and d["doc_type"] in MANDATORY_DOCS:
-            by_type.setdefault(d["doc_type"], d)
-    bank = (by_type.get("bank_statement") or {}).get("extraction")
-    itr = (by_type.get("itr") or {}).get("extraction")
-    gst = (by_type.get("gst_return") or {}).get("extraction")
+    bank, itr, gst, bureau, sources = _combine(docs)
     bm = bank_metrics(bank) if bank else None
-    contra = contradictions(app, bank, bm, itr, gst)
+    contra = contradictions(app, bank, bm, itr, gst, bureau)
     recon = bank["reconciliation"]["pct"] if bank else None
-    pol = policy(app, bm, itr, contra, recon)
-    return {"bank_metrics": bm, "contradictions": contra, "policy": pol,
-            "sources": {k: v["id"] for k, v in by_type.items()}}
+    pol = policy(app, bm, itr, contra, recon, bureau)
+    return {"bank_metrics": bm, "contradictions": contra, "policy": pol, "sources": sources,
+            "bank_accounts": (bank or {}).get("accounts", 0)}

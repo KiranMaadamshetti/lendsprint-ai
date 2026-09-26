@@ -19,23 +19,27 @@ def _fmt_fields(ext):
 
 
 def case_context(app, docs, analysis, include_txns=False):
-    by_type = {d["doc_type"]: d for d in docs if d.get("status") == "extracted"}
-    bank = (by_type.get("bank_statement") or {}).get("extraction")
+    from .analysis import _combine
+    bank, itr, gst, bureau, _ = _combine(docs)
     ctx = {
         "application": {k: app.get(k) for k in ("borrower_name", "business_name", "constitution", "industry", "business_vintage_years",
                                                  "loan_amount", "tenure_months", "interest_rate", "purpose", "declared_existing_emi")},
-        "itr": _fmt_fields((by_type.get("itr") or {}).get("extraction")),
-        "gst": {"header": _fmt_fields((by_type.get("gst_return") or {}).get("extraction")),
-                "periods": [{k: p.get(k) for k in ("period", "taxable_value", "filing_date")}
-                            for p in ((by_type.get("gst_return") or {}).get("extraction") or {}).get("periods", [])]},
+        "itr": _fmt_fields(itr),
+        "gst": {"header": _fmt_fields(gst), "periods": [{k: p.get(k) for k in ("period", "taxable_value", "filing_date")} for p in (gst or {}).get("periods", [])]},
         "bank_header": _fmt_fields(bank),
+        "bank_accounts_analysed": (bank or {}).get("accounts", 0),
+        "bureau": {"summary": _fmt_fields(bureau), "accounts": bureau.get("accounts", [])} if bureau else None,
+        "supporting_documents": [(d.get("classification") or {}).get("label") or d["filename"] for d in docs if d.get("doc_type") == "other"],
         "bank_metrics": analysis.get("bank_metrics"),
         "extraction_quality": {"bank_reconciliation": (bank or {}).get("reconciliation")},
         "contradictions": analysis.get("contradictions"),
         "policy": analysis.get("policy"),
     }
     if include_txns and bank:
-        ctx["bank_transactions"] = [[r["date"], r["narration"], r["debit"], r["credit"], r["balance"], r["category"]] for r in bank["rows"]]
+        rows = bank["rows"]
+        if len(rows) > 600:  # keep the chat prompt bounded for very long statements
+            rows = [r for r in rows if r["category"] not in ("business_receipt", "supplier_payment")] + rows[-200:]
+        ctx["bank_transactions"] = [[r["date"], r["narration"], r["debit"], r["credit"], r["balance"], r["category"]] for r in rows]
     return ctx
 
 
@@ -64,7 +68,7 @@ Write the credit assessment. Return JSON:
  "questions_for_borrower": ["specific questions to resolve open issues"],
  "what_would_change_decision": "the specific facts that would move this to a better or worse outcome",
  "suggested_amount": number | null   (a safer loan amount if the requested one is too high, else null)
-}}""", max_tokens=3000)
+}}""", max_tokens=8000)
     return out, meta
 
 
@@ -90,7 +94,7 @@ def ground_check(memo, analysis, ctx):
             ok = []
             for e in item.get("evidence", []) or []:
                 cited += 1
-                if e in valid or str(e).split(".")[0] in top or str(e).split(".")[0] in ("bank", "itr", "gst"):
+                if e in valid or str(e).split(".")[0] in top or str(e).split(".")[0] in ("bank", "itr", "gst", "bureau"):
                     ok.append(e)
                 else:
                     unknown += 1

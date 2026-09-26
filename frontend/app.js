@@ -5,7 +5,8 @@ const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const inr = (v, d = 0) => (v === null || v === undefined || v === "" || isNaN(v)) ? "-" : "₹" + Number(v).toLocaleString("en-IN", { maximumFractionDigits: d, minimumFractionDigits: d });
 const lakh = (v) => (v === null || v === undefined || isNaN(v)) ? "-" : (Math.abs(v) >= 1e7 ? `₹${(v / 1e7).toFixed(2)} Cr` : `₹${(v / 1e5).toFixed(2)} L`);
 const pct = (v, d = 1) => (v === null || v === undefined) ? "-" : `${(v * 100).toFixed(d)}%`;
-const DOC_LABEL = { bank_statement: "Bank Statement", itr: "ITR", gst_return: "GST Returns", other: "Other" };
+const DOC_LABEL = { bank_statement: "Bank Statement", itr: "ITR", gst_return: "GST Returns", bureau_report: "Bureau Report (CIBIL)", other: "Supporting doc" };
+const BUSY = ["uploaded", "ocr", "classifying", "extracting"];
 const REC_LABEL = { APPROVE: "Approve", APPROVE_WITH_CONDITIONS: "Approve with conditions", REFER: "Refer to credit committee", DECLINE: "Decline" };
 
 function actor() { return $("#actor").value; }
@@ -41,7 +42,7 @@ async function boot() {
   };
   $("#new-app-btn").onclick = () => { $("#new-app-form").reset(); delete $("#new-app-form").dataset.slug; S.newFiles = []; renderNewFiles(); $("#new-app-dialog").showModal(); };
   const ndz = $("#new-dropzone"), nfi = $("#new-files");
-  const addFiles = (fl) => { for (const f of fl) if (f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf")) S.newFiles.push(f); renderNewFiles(); };
+  const addFiles = (fl) => { for (const f of fl) if (/\.(pdf|png|jpe?g|webp)$/i.test(f.name)) S.newFiles.push(f); else toast(`${f.name}: only PDF / JPG / PNG supported`, true); renderNewFiles(); };
   nfi.onchange = () => { addFiles(nfi.files); nfi.value = ""; };
   ndz.ondragover = (e) => { e.preventDefault(); ndz.classList.add("drag"); };
   ndz.ondragleave = () => ndz.classList.remove("drag");
@@ -100,7 +101,7 @@ async function openApp(id) {
   clearInterval(S.poll);
   const prevId = S.current?.application.id;
   S.current = await api(`/api/applications/${id}`);
-  const processing = () => S.current.documents.some((d) => ["uploaded", "classifying", "extracting"].includes(d.status))
+  const processing = () => S.current.documents.some((d) => BUSY.includes(d.status))
     || ["documents", "crosscheck", "reasoning"].includes(S.current.application.live?.stage);
   if (S.forceTab) { S.tab = S.forceTab; delete S.forceTab; }
   else if (prevId !== id) S.tab = processing() || !latest() ? "live" : "assessment";
@@ -166,6 +167,11 @@ function docFacts(d) {
     push("Turnover", fv(e, "gross_receipts") != null ? lakh(fv(e, "gross_receipts")) : undefined);
     push("Net profit", fv(e, "net_profit") != null ? lakh(fv(e, "net_profit")) : undefined);
     push("Financial year", fv(e, "financial_year")); push("Tax paid", fv(e, "tax_paid") != null ? inr(fv(e, "tax_paid")) : undefined);
+  } else if (d.doc_type === "bureau_report") {
+    push("Bureau score", fv(e, "credit_score")); push("Active accounts", fv(e, "total_active_accounts"));
+    push("Total EMI", fv(e, "total_monthly_emi") != null ? inr(fv(e, "total_monthly_emi")) : undefined);
+    push("Overdue", fv(e, "total_overdue_amount") != null ? inr(fv(e, "total_overdue_amount")) : undefined);
+    push("Max DPD 12m", fv(e, "max_dpd_last_12_months")); push("Enquiries 6m", fv(e, "enquiries_last_6_months"));
   } else if (d.doc_type === "gst_return") {
     push("GSTIN", fv(e, "gstin")); push("Trade name", fv(e, "trade_name"));
     const ps = e.periods || [];
@@ -180,8 +186,8 @@ function docCard(d) {
   const st = d.status;
   const fin = ["extracted", "unused"].includes(st);
   const states = [
-    "done",
-    fin || st === "extracting" ? "done" : st === "error" && !d.classification ? "fail" : "run",
+    st === "ocr" ? "run" : st === "error" && !d.n_pages ? "fail" : st === "uploaded" && d.needs_ocr ? "" : "done",
+    fin || st === "extracting" ? "done" : st === "error" && !d.classification ? (d.n_pages ? "fail" : "") : ["ocr", "uploaded"].includes(st) && d.needs_ocr && !d.ocr_done ? "" : "run",
     fin ? "done" : st === "extracting" ? "run" : st === "error" && d.classification ? "fail" : "",
     st === "extracted" ? "done" : "",
   ];
@@ -199,19 +205,20 @@ function docCard(d) {
   return `<div class="doc-live ${cls}">
     <div class="flex between"><span class="fname">📄 ${esc(d.filename)}</span>${d.doc_type !== "other" || d.classification ? `<span class="pill ${d.doc_type === "other" ? "grey" : "ai"}">${DOC_LABEL[d.doc_type]}</span>` : ""}</div>
     <ul class="steps">
-      ${step(0, `PDF read · ${d.n_pages} page${d.n_pages > 1 ? "s" : ""}`)}
-      ${step(1, states[1] === "done" ? `AI identified: <b>${DOC_LABEL[d.doc_type]}</b>` : "AI identifying document type", typeSub)}
-      ${step(2, "AI extracting figures with evidence", extractSub)}
-      ${step(3, "Verified against the PDF")}
+      ${step(0, d.needs_ocr ? (d.ocr_done ? `Scanned document read by AI (OCR) · ${d.n_pages} page${d.n_pages > 1 ? "s" : ""}` : "AI reading scanned document (OCR)") : `PDF read · ${d.n_pages} page${d.n_pages > 1 ? "s" : ""}`)}
+      ${step(1, states[1] === "done" ? `AI identified: <b>${esc(d.classification?.label || DOC_LABEL[d.doc_type])}</b>` : "AI identifying document type", typeSub)}
+      ${d.doc_type === "other" && fin ? `<li class="done"><span class="ic">✓</span><div>Kept on file as supporting document</div></li>` : `${step(2, "AI extracting figures with evidence", extractSub)}
+      ${step(3, "Verified against the document")}`}
     </ul>
     ${d.error ? `<div class="small" style="color:var(--bad);margin-top:6px">${esc(d.error)}</div>` : ""}
     ${facts.length ? `<div class="facts">${facts.map(([l, v]) => `<div class="fact"><div class="l">${esc(l)}</div><div class="v">${esc(v)}</div></div>`).join("")}</div>` : ""}
   </div>`;
 }
+function rank(d) { return ({ bank_statement: 0, itr: 1, gst_return: 2, bureau_report: 3 }[d.doc_type] ?? (d.status === "error" ? 5 : BUSY.includes(d.status) ? 1.5 : 4)); }
 function tabLive() {
   const { documents: docs, readiness: r, application: a } = S.current;
   const live = a.live || {}; const L = latest();
-  const busyDocs = docs.some((d) => ["uploaded", "classifying", "extracting"].includes(d.status));
+  const busyDocs = docs.some((d) => BUSY.includes(d.status));
   const stage = live.stage || (L ? "done" : busyDocs ? "documents" : "idle");
   const analysis = stage === "reasoning" ? live.analysis : (stage === "done" && L ? L.analysis : null);
   const S_ = (name) => {
@@ -236,9 +243,9 @@ function tabLive() {
   return `
   ${verdict}
   <div class="card" style="margin-top:${verdict ? "16px" : "0"}"><div class="flex between"><h2>Documents</h2>
-    <span class="small muted">${docs.filter((d) => d.status === "extracted").length}/${docs.length} processed</span></div>
-    ${docs.length ? `<div class="live-grid">${docs.map(docCard).join("")}</div>` : ""}
-    ${!docs.length || stage === "blocked" ? `<div class="dropzone" id="dropzone" style="margin-top:12px">${stage === "blocked" ? `<b>Missing: ${r.missing.map((m) => DOC_LABEL[m]).join(", ")}</b>. ` : ""}Drop PDFs here or <label class="browse">browse<input type="file" id="file-input" accept="application/pdf" multiple hidden></label></div>` : ""}
+    <span class="small muted">${docs.filter((d) => !BUSY.includes(d.status)).length}/${docs.length} processed${docs.some((d) => d.status === "error") ? ` · <span style="color:var(--bad)">${docs.filter((d) => d.status === "error").length} could not be read</span>` : ""}</span></div>
+    ${docs.length ? `<div class="live-grid">${[...docs].sort((x, y) => rank(x) - rank(y)).map(docCard).join("")}</div>` : ""}
+    ${!docs.length || stage === "blocked" ? `<div class="dropzone" id="dropzone" style="margin-top:12px">${stage === "blocked" ? `<b>Missing: ${r.missing.map((m) => DOC_LABEL[m]).join(", ")}</b>. ` : ""}Drop PDFs here or <label class="browse">browse<input type="file" id="file-input" accept="application/pdf,image/png,image/jpeg,image/webp" multiple hidden></label></div>` : ""}
   </div>
   <div class="card"><h2>Credit Brain pipeline</h2>
     <div class="stage-row">${ic(S_("documents"), 1)}<div><b>Mandatory documents</b>
@@ -257,8 +264,8 @@ function tabLive() {
 
 // ---------------------------------------------------------------- overview
 function statusPill(d) {
-  const m = { uploaded: ["grey", "Queued"], classifying: ["ai", "AI classifying"], extracting: ["ai", "AI extracting"], extracted: ["ok", "Extracted"], error: ["bad", "Error"], unused: ["grey", "Not used"] }[d.status] || ["grey", d.status];
-  const spin = ["classifying", "extracting"].includes(d.status) ? `<span class="spinner"></span>` : "";
+  const m = { uploaded: ["grey", "Queued"], ocr: ["ai", "AI reading scan"], classifying: ["ai", "AI classifying"], extracting: ["ai", "AI extracting"], extracted: ["ok", "Extracted"], error: ["bad", "Error"], unused: ["grey", "Not used"] }[d.status] || ["grey", d.status];
+  const spin = ["ocr", "classifying", "extracting"].includes(d.status) ? `<span class="spinner"></span>` : "";
   return `<span class="pill ${m[0]}">${spin}${m[1]}</span>`;
 }
 function tabOverview() {
@@ -273,7 +280,7 @@ function tabOverview() {
   </div>
   <div class="card">
     <h2>Documents</h2>
-    <div class="dropzone" id="dropzone">Drop PDF files here or <label style="display:inline;color:var(--brand);cursor:pointer">browse<input type="file" id="file-input" accept="application/pdf" multiple hidden></label>
+    <div class="dropzone" id="dropzone">Drop PDF files here or <label style="display:inline;color:var(--brand);cursor:pointer">browse<input type="file" id="file-input" accept="application/pdf,image/png,image/jpeg,image/webp" multiple hidden></label>
       <div class="small" style="margin-top:6px">Credit Brain identifies each document type automatically - no need to label files.</div></div>
     <table style="margin-top:14px"><thead><tr><th>File</th><th>Type (AI-detected)</th><th>Status</th><th>Quality</th><th></th></tr></thead><tbody>
     ${docs.map((d) => `<tr>

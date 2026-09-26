@@ -122,6 +122,12 @@ def _process(doc_id, actor, classify=True):
     d = db.get("documents", doc_id)
     try:
         pages = d["pages"]
+        if d.get("needs_ocr") and not pages:
+            db.update("documents", doc_id, status="ocr")
+            with open(d["path"], "rb") as fh:
+                pages = extraction.transcribe(fh.read(), d["mime"])
+            d = db.update("documents", doc_id, pages=pages, n_pages=len(pages), ocr_done=True)
+            db.audit(d["app_id"], "Credit Brain (AI)", "Scanned document read (OCR)", {"file": d["filename"], "pages": len(pages)})
         if classify:
             db.update("documents", doc_id, status="classifying")
             c = extraction.classify(pages)
@@ -158,13 +164,27 @@ def _maybe_auto_assess(aid):
     if not a or not a.get("auto_assess", True):
         return
     docs = db.list_docs(aid)
-    if not docs or any(x.get("status") in ("uploaded", "classifying", "extracting") for x in docs):
+    if not docs or any(x.get("status") in ("uploaded", "ocr", "classifying", "extracting") for x in docs):
         return
     try:
         run_assessment(aid, "Credit Brain (auto)")
+    except Blocked:
+        pass  # recorded as a blocked decision; resumes when the missing documents arrive
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         _set_live(aid, "error", message=str(e)[:300])
+
+
+IMAGE_TYPES = {b"\x89PNG": "image/png", b"\xff\xd8\xff": "image/jpeg", b"RIFF": "image/webp"}
+
+
+def _sniff(raw: bytes, filename: str):
+    if raw[:5] == b"%PDF-":
+        return "application/pdf"
+    for sig, mime in IMAGE_TYPES.items():
+        if raw.startswith(sig):
+            return mime
+    return None
 
 
 @app.post("/api/applications/{aid}/documents")
@@ -175,20 +195,39 @@ async def upload_documents(aid: str, files: list[UploadFile] = File(...), x_acto
     _set_live(aid, "documents")
     created, to_process = [], []
     for f in files:
-        raw = await f.read()
-        if not raw[:5] == b"%PDF-":
-            raise HTTPException(400, f"{f.filename}: only PDF files are supported")
         doc_id = db.new_id("doc")
-        path = os.path.join(db.UPLOAD_DIR, f"{doc_id}.pdf")
-        with open(path, "wb") as fh:
-            fh.write(raw)
-        pages = pdftext.extract_pages(raw)
-        doc = {"id": doc_id, "app_id": aid, "filename": f.filename, "path": path, "pages": pages, "n_pages": len(pages),
+        doc = {"id": doc_id, "app_id": aid, "filename": f.filename, "pages": [], "n_pages": 0,
                "doc_type": "other", "type_source": None, "status": "uploaded", "created": db.now()}
-        if not pdftext.has_text(pages):
-            doc.update(status="error", error="No text layer found (scanned image?). OCR is on the roadmap - upload a text PDF.")
+        try:
+            raw = await f.read()
+            mime = _sniff(raw, f.filename or "")
+            ext = {"application/pdf": ".pdf", "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}.get(mime, ".bin")
+            path = os.path.join(db.UPLOAD_DIR, f"{doc_id}{ext}")
+            with open(path, "wb") as fh:
+                fh.write(raw)
+            doc.update(path=path, mime=mime, size=len(raw))
+            if mime is None:
+                doc.update(status="error", error="Unsupported file type - upload PDF, JPG or PNG.")
+            elif mime == "application/pdf":
+                try:
+                    pages = pdftext.extract_pages(raw)
+                    doc.update(pages=pages, n_pages=len(pages))
+                    if not pdftext.has_text(pages):
+                        doc["needs_ocr"] = True  # scanned PDF: the multimodal model will read it
+                except Exception as e:  # noqa: BLE001
+                    msg = str(e)
+                    if "password" in msg.lower() or "encrypt" in msg.lower() or type(e).__name__ in ("PDFPasswordIncorrect", "PdfminerException"):
+                        doc.update(status="error", error="Password-protected or unreadable PDF - remove the password and upload again.")
+                    else:
+                        doc["needs_ocr"] = True
+            else:
+                doc.update(needs_ocr=True, n_pages=1)
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            doc.update(status="error", error=f"Could not read file: {str(e)[:200]}")
         db.put("documents", doc_id, doc, aid)
-        db.audit(aid, actor_of(x_actor), "Document uploaded", {"file": f.filename, "pages": len(pages)})
+        db.audit(aid, actor_of(x_actor), "Document uploaded", {"file": f.filename, "pages": doc["n_pages"], "ocr": bool(doc.get("needs_ocr")),
+                                                               **({"error": doc["error"]} if doc.get("error") else {})})
         if doc["status"] != "error":
             to_process.append(doc_id)
         created.append(_public_doc(doc))
@@ -227,9 +266,9 @@ def delete_doc(doc_id: str, x_actor: str | None = Header(None)):
 @app.get("/api/documents/{doc_id}/file")
 def doc_file(doc_id: str):
     d = db.get("documents", doc_id)
-    if not d:
+    if not d or not d.get("path"):
         raise HTTPException(404)
-    return FileResponse(d["path"], media_type="application/pdf", filename=d["filename"])
+    return FileResponse(d["path"], media_type=d.get("mime") or "application/pdf", filename=d["filename"])
 
 
 @app.get("/api/documents/{doc_id}/text")
@@ -292,7 +331,7 @@ def run_assessment(aid, actor):
 def assess(aid: str, x_actor: str | None = Header(None)):
     _app_or_404(aid)
     docs = db.list_docs(aid)
-    if any(d.get("status") in ("uploaded", "classifying", "extracting") for d in docs):
+    if any(d.get("status") in ("uploaded", "ocr", "classifying", "extracting") for d in docs):
         raise HTTPException(409, "Documents are still being processed - try again in a few seconds.")
     try:
         record = run_assessment(aid, actor_of(x_actor))

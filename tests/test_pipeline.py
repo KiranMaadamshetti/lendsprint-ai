@@ -32,7 +32,10 @@ def _date(d):
 
 def fake_chat(system, messages, max_tokens=4000, json_mode=False):
     text = messages[-1]["content"]
+    if not isinstance(text, str):  # OCR request
+        return {"text": "[PAGE 1]\nGovernment of India - identity card (scanned)", "model": "stub", "latency_ms": 1, "usage": {}}
     if "Classify this document" in text:
+        text = text.split("DOCUMENT TEXT:")[-1]
         t = "bank_statement" if "Statement of Account" in text else "itr" if "INCOME TAX" in text else "gst_return" if "GSTR" in text else "other"
         out = {"doc_type": t, "confidence": 0.97, "reason": "stub"}
     elif "Transcribe EVERY transaction" in text:
@@ -154,3 +157,21 @@ def test_full_pipeline(client, slug):
     # override needs justification
     assert client.post(f"/api/applications/{aid}/decision", json={"decision": "DECLINE", "notes": ""}).status_code in (200, 400)
     assert client.post(f"/api/applications/{aid}/chat", json={"message": "why?"}).status_code == 200
+
+
+def test_mixed_batch_does_not_fail(client):
+    """A bad file in a batch must not break the upload; scans go through OCR; supporting docs are kept."""
+    aid = _create(client, "arvind_textiles")
+    png = b"\x89PNG\r\n\x1a\n" + b"0" * 100
+    files = [("files", ("broken.pdf", b"%PDF-1.4 garbage", "application/pdf")),
+             ("files", ("aadhaar.png", png, "image/png")),
+             ("files", ("notes.txt", b"hello", "text/plain")),
+             ("files", ("bank.pdf", open(os.path.join(ROOT, "sample_docs", "arvind_textiles_bank_statement.pdf"), "rb"), "application/pdf"))]
+    r = client.post(f"/api/applications/{aid}/documents", files=files)
+    assert r.status_code == 200, r.text
+    docs = {d["filename"]: d for d in client.get(f"/api/applications/{aid}").json()["documents"]}
+    assert docs["notes.txt"]["status"] == "error"
+    assert docs["aadhaar.png"]["status"] == "unused" and docs["aadhaar.png"]["ocr_done"]
+    assert docs["bank.pdf"]["status"] == "extracted"
+    app = client.get(f"/api/applications/{aid}").json()["application"]
+    assert app["live"]["stage"] == "blocked"

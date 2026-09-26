@@ -5,9 +5,11 @@ Configure with environment variables (see .env.example):
     ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY
     LLM_MODEL    = optional model override
 """
+import base64
 import json
 import os
 import re
+import threading
 import time
 
 import httpx
@@ -15,9 +17,16 @@ import httpx
 DEFAULT_MODELS = {
     "anthropic": "claude-sonnet-4-5",
     "openai": "gpt-4.1-mini",
-    "gemini": "gemini-2.5-flash",
+    "gemini": None,  # auto-discovered from the key's model list (Google retires versions often)
 }
 KEY_VARS = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY"}
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+# Throttle concurrent LLM calls so a batch of many documents doesn't trip provider rate limits.
+_sem = threading.BoundedSemaphore(int(os.getenv("LLM_CONCURRENCY", "4")))
+_resolved: dict[str, str] = {}
+_bad_models: set[str] = set()
+_resolve_lock = threading.Lock()
 
 
 class LLMNotConfigured(RuntimeError):
@@ -25,7 +34,9 @@ class LLMNotConfigured(RuntimeError):
 
 
 class LLMError(RuntimeError):
-    pass
+    def __init__(self, msg, status=None):
+        super().__init__(msg)
+        self.status = status
 
 
 def provider() -> str | None:
@@ -38,9 +49,46 @@ def provider() -> str | None:
     return None
 
 
-def model_name() -> str | None:
+def _gemini_pick(models):
+    """Choose the newest stable 'flash' model that supports generateContent."""
+    best, best_key = None, None
+    for m in models:
+        name = m.get("name", "").removeprefix("models/")
+        if "generateContent" not in m.get("supportedGenerationMethods", []) or name in _bad_models:
+            continue
+        mm = re.fullmatch(r"gemini-(\d+(?:\.\d+)?)-flash(-preview.*|-latest|-\d{3})?", name)
+        if not mm:
+            continue
+        preview = 1 if (mm.group(2) or "").startswith("-preview") else 0
+        key = (-preview, float(mm.group(1)), mm.group(2) is None)
+        if best_key is None or key > best_key:
+            best, best_key = name, key
+    return best
+
+
+def _resolve_gemini(key):
+    with _resolve_lock:
+        if "gemini" in _resolved:
+            return _resolved["gemini"]
+        try:
+            r = httpx.get(f"{GEMINI_BASE}/models?pageSize=200", headers={"x-goog-api-key": key}, timeout=30)
+            r.raise_for_status()
+            choice = _gemini_pick(r.json().get("models", []))
+        except Exception:  # noqa: BLE001
+            choice = None
+        _resolved["gemini"] = choice or "gemini-flash-latest"
+        return _resolved["gemini"]
+
+
+def model_name(resolve=True) -> str | None:
     p = provider()
-    return (os.getenv("LLM_MODEL") or DEFAULT_MODELS[p]) if p else None
+    if not p:
+        return None
+    if os.getenv("LLM_MODEL"):
+        return os.getenv("LLM_MODEL")
+    if p == "gemini":
+        return _resolve_gemini(os.getenv(KEY_VARS[p])) if resolve else _resolved.get("gemini", "auto")
+    return DEFAULT_MODELS[p]
 
 
 def status() -> dict:
@@ -48,38 +96,71 @@ def status() -> dict:
     return {"configured": bool(p), "provider": p, "model": model_name()}
 
 
-def _post(url, headers, payload, timeout=180):
+def _post(url, headers, payload, timeout=240):
     last = None
-    for attempt in range(3):
+    for attempt in range(6):
         try:
-            r = httpx.post(url, headers=headers, json=payload, timeout=timeout)
+            with _sem:
+                r = httpx.post(url, headers=headers, json=payload, timeout=timeout)
             if r.status_code in (429, 500, 502, 503, 529):
-                last = LLMError(f"{r.status_code}: {r.text[:300]}")
-                time.sleep(2 * (attempt + 1))
+                last = LLMError(f"{r.status_code}: {r.text[:300]}", r.status_code)
+                wait = float(r.headers.get("retry-after") or 0) or min(40, 3 * 2 ** attempt)
+                time.sleep(wait)
                 continue
             if r.status_code >= 400:
-                raise LLMError(f"{r.status_code}: {r.text[:500]}")
+                raise LLMError(f"{r.status_code}: {r.text[:500]}", r.status_code)
             return r.json()
         except httpx.HTTPError as e:
             last = LLMError(str(e))
-            time.sleep(2 * (attempt + 1))
+            time.sleep(min(20, 2 * (attempt + 1)))
     raise last
 
 
+def _gemini_parts(content):
+    if isinstance(content, str):
+        return [{"text": content}]
+    parts = []
+    for c in content:
+        if c.get("type") == "file":
+            parts.append({"inline_data": {"mime_type": c["mime"], "data": base64.b64encode(c["data"]).decode()}})
+        else:
+            parts.append({"text": c["text"]})
+    return parts
+
+
+def _anthropic_content(content):
+    if isinstance(content, str):
+        return content
+    out = []
+    for c in content:
+        if c.get("type") == "file":
+            kind = "document" if c["mime"] == "application/pdf" else "image"
+            out.append({"type": kind, "source": {"type": "base64", "media_type": c["mime"], "data": base64.b64encode(c["data"]).decode()}})
+        else:
+            out.append({"type": "text", "text": c["text"]})
+    return out
+
+
 def chat(system: str, messages: list[dict], max_tokens: int = 4000, json_mode: bool = False) -> dict:
-    """messages: [{"role": "user"|"assistant", "content": str}]. Returns {"text", "model", "latency_ms", "usage"}."""
+    """messages: [{"role": "user"|"assistant", "content": str | [{"type":"text","text":..}|{"type":"file","mime":..,"data":bytes}]}].
+    Returns {"text", "model", "latency_ms", "usage"}."""
     p = provider()
     if not p:
-        raise LLMNotConfigured("No LLM API key configured. Set ANTHROPIC_API_KEY (or OPENAI_API_KEY / GEMINI_API_KEY) in .env")
-    key, model = os.getenv(KEY_VARS[p]), model_name()
+        raise LLMNotConfigured("No LLM API key configured. Set GEMINI_API_KEY (or ANTHROPIC_API_KEY / OPENAI_API_KEY) in .env")
+    key = os.getenv(KEY_VARS[p])
     t0 = time.time()
     if p == "anthropic":
+        model = model_name()
+        msgs = [{"role": m["role"], "content": _anthropic_content(m["content"])} for m in messages]
         data = _post("https://api.anthropic.com/v1/messages",
                      {"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                     {"model": model, "max_tokens": max_tokens, "system": system, "messages": messages, "temperature": 0})
+                     {"model": model, "max_tokens": max_tokens, "system": system, "messages": msgs, "temperature": 0})
         text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
         usage = data.get("usage", {})
     elif p == "openai":
+        model = model_name()
+        if any(not isinstance(m["content"], str) for m in messages):
+            raise LLMError("Scanned documents need a Gemini or Claude key (OpenAI path supports text PDFs only).")
         payload = {"model": model, "messages": [{"role": "system", "content": system}] + messages,
                    "max_completion_tokens": max_tokens, "temperature": 0}
         if json_mode:
@@ -89,14 +170,30 @@ def chat(system: str, messages: list[dict], max_tokens: int = 4000, json_mode: b
         text = data["choices"][0]["message"]["content"]
         usage = data.get("usage", {})
     else:  # gemini
-        contents = [{"role": "model" if m["role"] == "assistant" else "user", "parts": [{"text": m["content"]}]} for m in messages]
-        cfg = {"maxOutputTokens": max_tokens, "temperature": 0}
+        contents = [{"role": "model" if m["role"] == "assistant" else "user", "parts": _gemini_parts(m["content"])} for m in messages]
+        cfg = {"maxOutputTokens": max(max_tokens, 8192), "temperature": 0}
         if json_mode:
             cfg["responseMimeType"] = "application/json"
-        data = _post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                     {"content-type": "application/json", "x-goog-api-key": key},
-                     {"systemInstruction": {"parts": [{"text": system}]}, "contents": contents, "generationConfig": cfg})
-        text = "".join(pt.get("text", "") for pt in data["candidates"][0]["content"]["parts"])
+        body = {"systemInstruction": {"parts": [{"text": system}]}, "contents": contents, "generationConfig": cfg}
+        for _ in range(3):
+            model = model_name()
+            try:
+                data = _post(f"{GEMINI_BASE}/models/{model}:generateContent",
+                             {"content-type": "application/json", "x-goog-api-key": key}, body)
+                break
+            except LLMError as e:
+                if e.status == 404 and not os.getenv("LLM_MODEL"):
+                    _bad_models.add(model)          # retired model: pick another one
+                    _resolved.pop("gemini", None)
+                    continue
+                raise
+        else:
+            raise LLMError("No usable Gemini model found for this API key. Set LLM_MODEL in .env.")
+        cand = (data.get("candidates") or [{}])[0]
+        parts = (cand.get("content") or {}).get("parts") or []
+        text = "".join(pt.get("text", "") for pt in parts if not pt.get("thought"))
+        if not text:
+            raise LLMError(f"Gemini returned no text (finishReason={cand.get('finishReason')}, block={data.get('promptFeedback')})")
         usage = data.get("usageMetadata", {})
     return {"text": text, "model": f"{p}/{model}", "latency_ms": int((time.time() - t0) * 1000), "usage": usage}
 

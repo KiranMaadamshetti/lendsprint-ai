@@ -14,7 +14,8 @@ DOC_TYPES = {
     "bank_statement": "Bank Statement",
     "itr": "Income Tax Return (ITR)",
     "gst_return": "GST Returns",
-    "other": "Other / Unclassified",
+    "bureau_report": "Credit Bureau Report (CIBIL)",
+    "other": "Other / Supporting",
 }
 
 CREDIT_CATEGORIES = ["business_receipt", "cash_deposit", "loan_disbursal", "own_transfer_in", "refund_reversal", "interest_credit", "other_credit"]
@@ -32,14 +33,35 @@ def classify(pages: list[str]) -> dict:
 - bank_statement: a bank account statement with transactions
 - itr: an Indian Income Tax Return / ITR acknowledgement / computation of income
 - gst_return: GST returns (GSTR-1 / GSTR-3B) or a GST filing summary
-- other: anything else
+- bureau_report: a credit bureau report (CIBIL / TransUnion, Experian, Equifax, CRIF High Mark) with score and loan accounts
+- other: anything else (KYC, sanction letters, property papers, financial statements, photos...)
 
-Return JSON: {{"doc_type": "...", "confidence": 0.0-1.0, "reason": "one short sentence citing what in the text told you"}}
+Return JSON: {{"doc_type": "...", "label": "short human name of what this document actually is, e.g. 'Aadhaar card', 'CIBIL consumer report', 'HDFC current account statement'",
+ "confidence": 0.0-1.0, "reason": "one short sentence citing what in the text told you"}}
 
 DOCUMENT TEXT:
 {sample}""", max_tokens=300)
     dt = out.get("doc_type") if out.get("doc_type") in DOC_TYPES else "other"
-    return {"doc_type": dt, "confidence": float(out.get("confidence", 0)), "reason": out.get("reason", ""), "model": meta["model"]}
+    return {"doc_type": dt, "label": out.get("label") or DOC_TYPES[dt], "confidence": float(out.get("confidence") or 0),
+            "reason": out.get("reason", ""), "model": meta["model"]}
+
+
+def transcribe(raw: bytes, mime: str) -> list[str]:
+    """OCR for scanned PDFs / photos: the multimodal LLM reads the file and returns page-marked text."""
+    res = llm.chat(
+        "You are a meticulous OCR engine for Indian banking documents. You transcribe exactly what is printed and never summarise.",
+        [{"role": "user", "content": [
+            {"type": "file", "mime": mime, "data": raw},
+            {"type": "text", "text": "Transcribe this document completely. Start each page with a line '[PAGE n]'. "
+                                     "Render every table row as cells separated by ' | ', keeping column order and all numbers exactly as printed. "
+                                     "Output only the transcription."}]}],
+        max_tokens=32000)
+    text = res["text"]
+    chunks = re.split(r"(?=\[PAGE \d+\])", text)
+    pages = [c.strip() for c in chunks if c.strip()]
+    if not pages or not pages[0].startswith("[PAGE"):
+        pages = [f"[PAGE 1]\n{text.strip()}"]
+    return pages
 
 
 # ---------------------------------------------------------------------------------------
@@ -79,6 +101,23 @@ GST TEXT:
             "model": meta["model"], "latency_ms": meta["latency_ms"]}
 
 
+def extract_bureau(pages):
+    text = "\n\n".join(pages)
+    out, meta = llm.chat_json(
+        "You extract data from Indian credit bureau reports (CIBIL, Experian, Equifax, CRIF) for underwriting. Never invent values.",
+        f"""Extract header fields: subject_name, pan, bureau, report_date, credit_score,
+total_active_accounts, total_current_balance, total_overdue_amount, total_monthly_emi (sum of EMIs of ACTIVE loans if EMIs are shown),
+max_dpd_last_12_months (highest days-past-due in last 12 months, 0 if none), enquiries_last_6_months, written_off_or_settled_accounts.
+{FIELD_RULES}
+Also list active loan accounts in "accounts": [{{"lender": "...", "type": "...", "sanctioned": n, "current_balance": n, "emi": n|null, "overdue": n, "dpd_recent": "..."}}]
+Return JSON: {{"fields": {{...}}, "accounts": [...], "notes": "credit-relevant observations"}}
+
+BUREAU REPORT TEXT:
+{text[:60000]}""", max_tokens=6000)
+    return {"fields": out.get("fields", {}), "accounts": out.get("accounts", []), "notes": out.get("notes", ""),
+            "model": meta["model"], "latency_ms": meta["latency_ms"]}
+
+
 def _bank_page(page_text, first):
     header_part = f"""Also return "fields" for the account header: account_holder, bank_name, account_number, account_type, period_from, period_to.
 {FIELD_RULES}""" if first else 'Return "fields": {} for this page.'
@@ -99,7 +138,7 @@ def _bank_page(page_text, first):
 Return JSON: {{"fields": {{...}}, "rows": [[...], ...]}}
 
 PAGE TEXT:
-{page_text}""", max_tokens=8000)
+{page_text}""", max_tokens=16000)
     return out, meta
 
 
@@ -212,6 +251,9 @@ def run_extraction(doc_type, pages, progress=None):
         res = extract_gst(pages)
         verify_evidence(res["fields"], pages)
         verify_periods(res["periods"], pages)
+    elif doc_type == "bureau_report":
+        res = extract_bureau(pages)
+        verify_evidence(res["fields"], pages)
     else:
-        return {"fields": {}, "notes": "Unclassified document - not used in the credit analysis."}
+        return {"fields": {}, "notes": "Supporting document - kept on file, not used in the credit calculations."}
     return res
