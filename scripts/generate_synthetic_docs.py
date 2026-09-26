@@ -209,7 +209,8 @@ def gst_returns(b, monthly_receipts, rng, path):
           Spacer(1, 6 * mm)]
     rows = [["Tax Period", "ARN", "Filing Date", "Taxable value of outward supplies (INR)", "IGST", "CGST", "SGST"]]
     for (y, m) in MONTHS:
-        tv = round(monthly_receipts[(y, m)] * b["gst_ratio"] * rng.uniform(0.97, 1.03), -2)
+        # receipts are tax-inclusive: invoice value (taxable + 6% tax here) = receipts x ratio
+        tv = round(monthly_receipts[(y, m)] * b["gst_ratio"] / 1.06 * rng.uniform(0.97, 1.03), -2)
         igst = round(tv * 0.03, 2)
         cs = round(tv * 0.015, 2)
         fd = date(y, m, 28) + timedelta(days=rng.randint(19, 24))

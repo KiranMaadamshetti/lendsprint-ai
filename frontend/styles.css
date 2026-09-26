@@ -177,3 +177,4 @@ dialog.wide { width: min(820px, 96vw); max-height: 94vh; }
 .verdict { display: flex; gap: 18px; align-items: center; padding: 18px; border-radius: var(--radius); background: linear-gradient(135deg, #f4f7ff, #fff); border: 1px solid #c9d6f5; animation: pop .5s ease-out; }
 .pulse { animation: pulse 1.4s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: .45; } }
+.flag { font-size: 12px; color: #8a4b00; background: var(--warn-soft); border-radius: 6px; padding: 4px 8px; margin-top: 4px; }

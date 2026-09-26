@@ -167,6 +167,9 @@ function docFacts(d) {
     push("Turnover", fv(e, "gross_receipts") != null ? lakh(fv(e, "gross_receipts")) : undefined);
     push("Net profit", fv(e, "net_profit") != null ? lakh(fv(e, "net_profit")) : undefined);
     push("Financial year", fv(e, "financial_year")); push("Tax paid", fv(e, "tax_paid") != null ? inr(fv(e, "tax_paid")) : undefined);
+  } else if (d.doc_type === "other") {
+    Object.entries(e.fields || {}).filter(([, f]) => f && f.value != null && f.value !== "").slice(0, 4)
+      .forEach(([k, f]) => push(k.replace(/_/g, " "), String(f.value).slice(0, 60)));
   } else if (d.doc_type === "bureau_report") {
     push("Bureau score", fv(e, "credit_score")); push("Active accounts", fv(e, "total_active_accounts"));
     push("Total EMI", fv(e, "total_monthly_emi") != null ? inr(fv(e, "total_monthly_emi")) : undefined);
@@ -179,7 +182,7 @@ function docFacts(d) {
     push("Declared turnover", ps.length ? lakh(ps.reduce((a, p) => a + Number(p.taxable_value || 0), 0)) : undefined);
   }
   const f = Object.values(e.fields || {}).filter((x) => x && typeof x === "object" && x.value != null);
-  if (f.length) push("Evidence verified", `${f.filter((x) => x.verified).length}/${f.length}`);
+  if (f.length && d.doc_type !== "other") push("Evidence verified", `${f.filter((x) => x.verified).length}/${f.length}`);
   return out;
 }
 function docCard(d) {
@@ -203,7 +206,7 @@ function docCard(d) {
   const cls = st === "error" ? "err" : ["extracted", "unused"].includes(st) ? "done" : "active";
   const facts = docFacts(d);
   return `<div class="doc-live ${cls}">
-    <div class="flex between"><span class="fname">📄 ${esc(d.filename)}</span>${d.doc_type !== "other" || d.classification ? `<span class="pill ${d.doc_type === "other" ? "grey" : "ai"}">${DOC_LABEL[d.doc_type]}</span>` : ""}</div>
+    <div class="flex between"><span class="fname">📄 ${esc(d.filename)}</span>${d.doc_type !== "other" || d.classification ? `<span class="pill ${d.doc_type === "other" ? "grey" : "ai"}">${d.doc_type === "other" ? esc((d.extraction?.category || "supporting").replace("_", " ")) : DOC_LABEL[d.doc_type]}</span>` : ""}</div>
     <ul class="steps">
       ${step(0, d.needs_ocr ? (d.ocr_done ? `Scanned document read by AI (OCR) · ${d.n_pages} page${d.n_pages > 1 ? "s" : ""}` : "AI reading scanned document (OCR)") : `PDF read · ${d.n_pages} page${d.n_pages > 1 ? "s" : ""}`)}
       ${step(1, states[1] === "done" ? `AI identified: <b>${esc(d.classification?.label || DOC_LABEL[d.doc_type])}</b>` : "AI identifying document type", typeSub)}
@@ -211,7 +214,9 @@ function docCard(d) {
       ${step(3, "Verified against the document")}`}
     </ul>
     ${d.error ? `<div class="small" style="color:var(--bad);margin-top:6px">${esc(d.error)}</div>` : ""}
+    ${d.extraction?.summary ? `<div class="small" style="margin-top:8px">${esc(d.extraction.summary)}</div>` : ""}
     ${facts.length ? `<div class="facts">${facts.map(([l, v]) => `<div class="fact"><div class="l">${esc(l)}</div><div class="v">${esc(v)}</div></div>`).join("")}</div>` : ""}
+    ${(d.extraction?.flags || []).length ? `<div style="margin-top:8px">${d.extraction.flags.map((x) => `<div class="flag">⚠ ${esc(x)}</div>`).join("")}</div>` : ""}
   </div>`;
 }
 function rank(d) { return ({ bank_statement: 0, itr: 1, gst_return: 2, bureau_report: 3 }[d.doc_type] ?? (d.status === "error" ? 5 : BUSY.includes(d.status) ? 1.5 : 4)); }
@@ -247,6 +252,11 @@ function tabLive() {
     ${docs.length ? `<div class="live-grid">${[...docs].sort((x, y) => rank(x) - rank(y)).map(docCard).join("")}</div>` : ""}
     ${!docs.length || stage === "blocked" ? `<div class="dropzone" id="dropzone" style="margin-top:12px">${stage === "blocked" ? `<b>Missing: ${r.missing.map((m) => DOC_LABEL[m]).join(", ")}</b>. ` : ""}Drop PDFs here or <label class="browse">browse<input type="file" id="file-input" accept="application/pdf,image/png,image/jpeg,image/webp" multiple hidden></label></div>` : ""}
   </div>
+  ${(() => {
+    const fl = docs.filter((d) => (d.extraction?.flags || []).length);
+    return fl.length ? `<div class="card"><h2>⚠ Red flags spotted in documents <span class="small muted">(${fl.reduce((a, d) => a + d.extraction.flags.length, 0)})</span></h2>
+      <table><tbody>${fl.map((d) => d.extraction.flags.map((x) => `<tr><td style="width:32%"><b>${esc(d.classification?.label || d.filename)}</b><div class="small muted">${esc(d.filename)}</div></td><td>${esc(x)}</td></tr>`).join("")).join("")}</tbody></table></div>` : "";
+  })()}
   <div class="card"><h2>Credit Brain pipeline</h2>
     <div class="stage-row">${ic(S_("documents"), 1)}<div><b>Mandatory documents</b>
       <div class="checklist" style="margin-top:6px">${r.items.map((i) => `<div class="check ${i.present ? "ok" : i.pending ? "pending" : "missing"}">${i.present ? "✓" : i.pending ? '<span class="spinner"></span>' : "✕"} ${DOC_LABEL[i.doc_type]}</div>`).join("")}</div>
@@ -375,7 +385,9 @@ function tabCashflow() {
     ${kpi("Avg monthly business credits", lakh(bm.avg_monthly_business_credits))}${kpi("Annualised turnover", lakh(bm.annualised_business_credits))}
     ${kpi("Avg operating outflows / m", lakh(bm.avg_monthly_operating_outflows))}${kpi("Observed EMIs / m", inr(bm.observed_monthly_emi))}
     ${kpi("Average balance", lakh(bm.average_balance))}${kpi("Minimum balance", lakh(bm.min_balance))}
-    ${kpi("Cash deposit share", pct(bm.cash_deposit_share))}${kpi("Bounces", bm.bounces.length)}</div></div>
+    ${kpi("Cash deposit share", pct(bm.cash_deposit_share))}${kpi("Bounces", bm.bounces.length)}</div>
+    ${(bm.business_accounts || []).length ? `<p class="small muted" style="margin-top:10px"><b>Business accounts used for turnover:</b> ${bm.business_accounts.map(esc).join(", ")}${(bm.personal_accounts || []).length ? `<br/><b>Personal accounts (obligations only):</b> ${bm.personal_accounts.map(esc).join(", ")} · EMIs seen there ${inr(bm.personal_monthly_emi)}/m` : ""}</p>` : ""}
+    ${(bm.accounts || []).length ? `<p class="small muted">${bm.accounts.map((a) => `${esc(a.source)}: avg balance ${inr(a.average_balance)}${a.overdrawn ? " (overdrawn CC/OD - excluded from ABB)" : ""}`).join(" · ")}</p>` : ""}</div>
   <div class="card"><h2>Bank business credits vs GST-declared turnover</h2>
     <div class="bars">${bm.monthly.map((m) => `<div class="bargroup" title="${m.month}: bank ${inr(m.business_credits)} / GST ${inr(gst[m.month])}">
       <div class="bar bank" style="height:${(m.business_credits / max) * 100}%"></div><div class="bar gst" style="height:${((gst[m.month] || 0) / max) * 100}%"></div></div>`).join("")}</div>

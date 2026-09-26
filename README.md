@@ -53,6 +53,17 @@ You can override it with `LLM_PROVIDER` and `LLM_MODEL`.
 6. **Ask Credit Brain**: "What loan amount keeps FOIR under 60%?"
 7. Record the officer decision. An override without a justification is rejected. Then show the **Audit log**.
 
+### Full MSME loan file (37 documents)
+`sample_docs/msme_loan_file/` holds a complete synthetic loan file for **Sai Durga Precision Engineering** (applicant Kolluri Venkata Ramana,
+co-applicant Kolluri Lalitha), which asks for a ₹35 lakh term loan to buy a CNC machine against their house. It contains: the application form, business profile,
+Udyam, GST registration, shop licence (vintage), lease, utility bills, 2 ITRs, audited financials, GSTR-3B (12 months), GSTR-1,
+current account + cash-credit account + 2 personal savings statements, 2 consumer CIBIL-style reports + commercial report,
+PAN/Aadhaar images for both applicants (these go through AI OCR), sale deed, encumbrance certificate, a scanned tax receipt (OCR), approved plan,
+valuation report, legal report, sales and purchase invoices, stock statement, debtor/creditor ageing, existing sanction letter and machine quotation.
+In the New application form, choose *Sai Durga Precision Engineering* and drop the whole folder.
+Red flags planted for the AI to find: an undisclosed co-applicant personal loan, the collateral already mortgaged to another bank,
+one cheque return in the CC account, and a built-up area that deviates from the approved plan. Regenerate the file with `python scripts/generate_msme_loan_file.py`.
+
 ### Synthetic data
 `scripts/generate_synthetic_docs.py` generates the PDFs in `sample_docs/`: 3 fictitious borrowers, each with a
 6-month bank statement, GSTR-3B summary and ITR. The generator is only used to create the test documents. The app never

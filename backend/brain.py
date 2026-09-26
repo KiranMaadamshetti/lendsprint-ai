@@ -20,7 +20,7 @@ def _fmt_fields(ext):
 
 def case_context(app, docs, analysis, include_txns=False):
     from .analysis import _combine
-    bank, itr, gst, bureau, _ = _combine(docs)
+    bank, itr, gst, bureau, _, personal = _combine(docs)
     ctx = {
         "application": {k: app.get(k) for k in ("borrower_name", "business_name", "constitution", "industry", "business_vintage_years",
                                                  "loan_amount", "tenure_months", "interest_rate", "purpose", "declared_existing_emi")},
@@ -28,8 +28,14 @@ def case_context(app, docs, analysis, include_txns=False):
         "gst": {"header": _fmt_fields(gst), "periods": [{k: p.get(k) for k in ("period", "taxable_value", "filing_date")} for p in (gst or {}).get("periods", [])]},
         "bank_header": _fmt_fields(bank),
         "bank_accounts_analysed": (bank or {}).get("accounts", 0),
-        "bureau": {"summary": _fmt_fields(bureau), "accounts": bureau.get("accounts", [])} if bureau else None,
-        "supporting_documents": [(d.get("classification") or {}).get("label") or d["filename"] for d in docs if d.get("doc_type") == "other"],
+        "bureau": {"combined": _fmt_fields(bureau), "reports": bureau.get("reports", []), "accounts": bureau.get("accounts", [])} if bureau else None,
+        "personal_accounts": (personal or {}).get("account_names", []),
+        "supporting_documents": [{"doc": (d.get("classification") or {}).get("label") or d["filename"],
+                                  "category": (d.get("extraction") or {}).get("category"),
+                                  "summary": (d.get("extraction") or {}).get("summary"),
+                                  "facts": _fmt_fields(d.get("extraction")),
+                                  "flags": (d.get("extraction") or {}).get("flags", [])}
+                                 for d in docs if d.get("doc_type") == "other" and d.get("status") == "extracted"],
         "bank_metrics": analysis.get("bank_metrics"),
         "extraction_quality": {"bank_reconciliation": (bank or {}).get("reconciliation")},
         "contradictions": analysis.get("contradictions"),
@@ -47,7 +53,10 @@ MEMO_SYSTEM = """You are the Credit Brain of an Indian bank's MSME lending desk,
 Reason like a seasoned underwriter: triangulate bank, GST and ITR evidence, weigh policy results and contradictions,
 and be explicit about uncertainty. Use ONLY the facts provided - never invent numbers. Amounts are INR.
 Every strength and risk must cite evidence ids from the provided data: policy rule ids (e.g. P-FOIR), contradiction ids
-(e.g. C-TURNOVER) or data paths (e.g. bank_metrics.bounces, itr.net_profit, gst.periods)."""
+(e.g. C-TURNOVER), data paths (e.g. bank_metrics.bounces, itr.net_profit, gst.periods, bureau.reports) or a supporting document as
+"doc:<its doc name>". Read the supporting documents like a credit officer: check identity consistency (names, PAN) across KYC,
+application and bureau; collateral title, ownership and existing charges (sale deed, EC, legal and valuation reports);
+business vintage and registrations; and whether the application's declarations are contradicted anywhere."""
 
 
 def credit_memo(app, docs, analysis):
@@ -94,7 +103,7 @@ def ground_check(memo, analysis, ctx):
             ok = []
             for e in item.get("evidence", []) or []:
                 cited += 1
-                if e in valid or str(e).split(".")[0] in top or str(e).split(".")[0] in ("bank", "itr", "gst", "bureau"):
+                if e in valid or str(e).split(".")[0] in top or str(e).split(".")[0] in ("bank", "itr", "gst", "bureau") or str(e).startswith("doc:"):
                     ok.append(e)
                 else:
                     unknown += 1

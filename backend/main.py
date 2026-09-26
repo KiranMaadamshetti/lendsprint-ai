@@ -134,9 +134,15 @@ def _process(doc_id, actor, classify=True):
             d = db.update("documents", doc_id, doc_type=c["doc_type"], type_source="ai", classification=c)
             db.audit(d["app_id"], "Credit Brain (AI)", "Document classified",
                      {"file": d["filename"], "doc_type": c["doc_type"], "confidence": c["confidence"], "reason": c["reason"]})
-        db.update("documents", doc_id, status="extracting", progress={"pages_done": 0, "pages_total": len(pages), "rows": 0})
-        ext = extraction.run_extraction(d["doc_type"], pages, progress=lambda p: db.update("documents", doc_id, progress=p))
-        d = db.update("documents", doc_id, extraction=ext, status="extracted" if d["doc_type"] != "other" else "unused")
+        if d["doc_type"] == "other":
+            sup = (d.get("classification") or {}).get("support") or {"fields": {}, "flags": [], "summary": ""}
+            ext = {"fields": extraction.verify_evidence(sup.get("fields") or {}, pages), "summary": sup.get("summary", ""),
+                   "flags": sup.get("flags", []), "category": sup.get("category", "other"),
+                   "model": (d.get("classification") or {}).get("model"), "latency_ms": (d.get("classification") or {}).get("latency_ms")}
+        else:
+            db.update("documents", doc_id, status="extracting", progress={"pages_done": 0, "pages_total": len(pages), "rows": 0})
+            ext = extraction.run_extraction(d["doc_type"], pages, progress=lambda p: db.update("documents", doc_id, progress=p))
+        d = db.update("documents", doc_id, extraction=ext, status="extracted")
         detail = {"file": d["filename"], "doc_type": d["doc_type"], "model": ext.get("model"), "latency_ms": ext.get("latency_ms")}
         if d["doc_type"] == "bank_statement":
             detail.update(transactions=len(ext["rows"]), reconciliation_pct=ext["reconciliation"]["pct"])
@@ -376,6 +382,10 @@ def chat(aid: str, body: ChatIn, x_actor: str | None = Header(None)):
 
 # ---- demo seeding (synthetic) --------------------------------------------------------
 DEMO_CASES = [
+    ("msme_loan_file", dict(borrower_name="Kolluri Venkata Ramana", business_name="Sai Durga Precision Engineering",
+                            constitution="Proprietorship", industry="Auto components - precision machining", business_vintage_years=10,
+                            loan_amount=3500000, tenure_months=60, interest_rate=12.25,
+                            purpose="CNC Vertical Machining Centre (VMC 850)", declared_existing_emi=52100)),
     ("arvind_textiles", dict(borrower_name="Arvind Kumar Ramasamy", business_name="Arvind Textiles", industry="Textiles - knitwear",
                              business_vintage_years=9, loan_amount=2500000, tenure_months=60, interest_rate=11.5,
                              purpose="Two knitting machines + working capital", declared_existing_emi=45200)),

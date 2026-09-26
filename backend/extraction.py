@@ -25,25 +25,50 @@ EVENT_CATEGORIES = ["bounce_return", "opening_balance", "closing_balance"]
 
 
 # ---------------------------------------------------------------------------------------
-def classify(pages: list[str]) -> dict:
-    sample = "\n".join(pages)[:3500]
-    out, meta = llm.chat_json(
-        "You are a document-intake analyst at an Indian bank's credit department. Classify uploaded borrower documents.",
-        f"""Classify this document into exactly one type:
-- bank_statement: a bank account statement with transactions
-- itr: an Indian Income Tax Return / ITR acknowledgement / computation of income
-- gst_return: GST returns (GSTR-1 / GSTR-3B) or a GST filing summary
-- bureau_report: a credit bureau report (CIBIL / TransUnion, Experian, Equifax, CRIF High Mark) with score and loan accounts
-- other: anything else (KYC, sanction letters, property papers, financial statements, photos...)
+SUPPORT_CATEGORIES = ["application", "kyc", "business_proof", "financials", "property", "trade", "loan", "other"]
 
-Return JSON: {{"doc_type": "...", "label": "short human name of what this document actually is, e.g. 'Aadhaar card', 'CIBIL consumer report', 'HDFC current account statement'",
- "confidence": 0.0-1.0, "reason": "one short sentence citing what in the text told you"}}
+
+def classify(pages: list[str]) -> dict:
+    """Identify the document; for supporting documents also pull key facts and red flags in the same call."""
+    sample = "\n".join(pages)[:9000]
+    out, meta = llm.chat_json(
+        "You are a document-intake analyst in the credit department of an Indian bank processing MSME loan files. "
+        "You identify each document and note what a credit officer must know from it. Never invent facts.",
+        f"""Identify this document. doc_type must be exactly one of:
+- bank_statement: a bank account statement with transactions (current, cash credit/OD or savings)
+- itr: an Indian Income Tax Return / ITR acknowledgement / computation of income
+- gst_return: GST RETURNS filed (GSTR-3B / GSTR-1 / annual return) with period-wise turnover. A GST *registration certificate* is NOT a return -> other
+- bureau_report: a credit bureau report (consumer or commercial) with score/rank and loan accounts
+- other: anything else - application form, KYC (PAN/Aadhaar), Udyam/MSME certificate, GST registration, licences, lease,
+  utility bills, audited financials, property papers (sale deed, EC, tax receipt, plan, valuation, legal report),
+  invoices, stock statement, ageing, sanction letters, quotations, business profile
+
+Return JSON:
+{{"doc_type": "...",
+ "label": "short name of what this document actually is, e.g. 'Encumbrance certificate', 'PAN card - co-applicant', 'Current account statement'",
+ "category": one of {SUPPORT_CATEGORIES} (for doc_type other; else ""),
+ "confidence": 0.0-1.0,
+ "reason": "one short sentence citing what in the text told you",
+ "summary": "for doc_type other: 1-2 sentences on what the document establishes for the loan",
+ "key_facts": [ for doc_type other only: up to 10 facts a credit officer needs (names, PAN, dates, amounts, areas, owners, charges, limits, declarations),
+               {{"name": "...", "value": "...", "evidence": "<exact verbatim snippet from the text>", "page": n, "confidence": 0-1}} ],
+ "flags": [ for doc_type other only: concerns visible IN THIS document (e.g. existing mortgage, overdue debtors, deviation from plan, declaration that may be false); [] if none ]
+}}
 
 DOCUMENT TEXT:
-{sample}""", max_tokens=300)
+{sample}""", max_tokens=3000)
     dt = out.get("doc_type") if out.get("doc_type") in DOC_TYPES else "other"
-    return {"doc_type": dt, "label": out.get("label") or DOC_TYPES[dt], "confidence": float(out.get("confidence") or 0),
-            "reason": out.get("reason", ""), "model": meta["model"]}
+    res = {"doc_type": dt, "label": out.get("label") or DOC_TYPES[dt], "confidence": float(out.get("confidence") or 0),
+           "reason": out.get("reason", ""), "model": meta["model"], "latency_ms": meta["latency_ms"]}
+    if dt == "other":
+        facts = {}
+        for i, f in enumerate(out.get("key_facts") or []):
+            if isinstance(f, dict) and f.get("name"):
+                key = str(f["name"]).strip().lower().replace(" ", "_")[:40] or f"fact_{i}"
+                facts[key if key not in facts else f"{key}_{i}"] = {k: f.get(k) for k in ("value", "evidence", "page", "confidence")}
+        res["support"] = {"category": out.get("category") or "other", "summary": out.get("summary", ""),
+                          "fields": facts, "flags": [str(x) for x in (out.get("flags") or []) if x]}
+    return res
 
 
 def transcribe(raw: bytes, mime: str) -> list[str]:
@@ -92,7 +117,7 @@ def extract_gst(pages):
 Header fields: gstin, legal_name, trade_name, return_type.
 {FIELD_RULES}
 Also extract "periods": one entry per tax period:
-{{"period": "YYYY-MM", "taxable_value": <number>, "total_tax": <number|null>, "filing_date": "YYYY-MM-DD"|null, "evidence": "<verbatim row text>", "page": n, "confidence": 0-1}}
+{{"period": "YYYY-MM", "taxable_value": <number>, "total_tax": <IGST+CGST+SGST+cess for the period, number|null>, "filing_date": "YYYY-MM-DD"|null, "evidence": "<verbatim row text>", "page": n, "confidence": 0-1}}
 Return JSON: {{"fields": {{...}}, "periods": [...], "notes": "e.g. late filings, nil returns, anything unusual"}}
 
 GST TEXT:
@@ -255,5 +280,5 @@ def run_extraction(doc_type, pages, progress=None):
         res = extract_bureau(pages)
         verify_evidence(res["fields"], pages)
     else:
-        return {"fields": {}, "notes": "Supporting document - kept on file, not used in the credit calculations."}
+        return {"fields": {}, "notes": "Supporting document."}
     return res

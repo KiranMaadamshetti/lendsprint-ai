@@ -53,12 +53,13 @@ def readiness(docs):
 def bank_metrics(bank):
     rows = bank.get("rows", [])
     by_month = defaultdict(lambda: defaultdict(float))
-    bounces, emi_lenders, balances = [], defaultdict(float), []
+    bounces, emi_lenders = [], defaultdict(float)
+    per_acct = defaultdict(list)
     for r in rows:
         m = _month(r["date"])
         cat = r["category"]
         if r["balance"] and cat not in ("opening_balance", "closing_balance"):
-            balances.append(r["balance"])
+            per_acct[r.get("source", "account")].append(r["balance"])
         if not m or cat in ("opening_balance", "closing_balance"):
             continue
         amt = r["credit"] or r["debit"]
@@ -93,8 +94,11 @@ def bank_metrics(bank):
         "observed_monthly_emi": round(sum(x["emi_debits"] for x in monthly) / n, 2),
         "emi_lenders": lenders,
         "bounces": bounces,
-        "average_balance": round(sum(balances) / len(balances), 2) if balances else 0,
-        "min_balance": min(balances) if balances else 0,
+        "accounts": [{"source": k, "average_balance": round(sum(v) / len(v), 2), "min_balance": min(v), "overdrawn": sum(v) / len(v) < 0}
+                     for k, v in per_acct.items() if v],
+        # ABB: sum of average balances of accounts in credit; overdrawn CC/OD accounts are shown separately
+        "average_balance": round(sum(sum(v) / len(v) for v in per_acct.values() if v and sum(v) >= 0), 2),
+        "min_balance": min((min(v) for v in per_acct.values() if v and sum(v) >= 0), default=0),
         "excluded_non_business_credits": {k: v for k, v in excluded.items() if v},
     }
 
@@ -119,17 +123,23 @@ def contradictions(app, bank, bm, itr, gst, bureau=None):
                         "variance_pct": round(v * 100, 1), "lhs": {"label": "Bureau total EMI (active loans)", "value": b_emi},
                         "rhs": {"label": "Declared in application", "value": declared},
                         "explain": "The bureau shows obligations the borrower did not declare."})
-    # 1. GST declared turnover vs bank business credits, same months only
+    # 1. GST invoice value (taxable + tax, i.e. what customers actually pay) vs bank business credits, same months only
     if bank and gst and bm["months"]:
-        gst_by_m = {p.get("period"): float(p.get("taxable_value") or 0) for p in gst.get("periods", [])}
+        gst_by_m, taxed = {}, 0
+        for p in gst.get("periods", []):
+            tv = float(p.get("taxable_value") or 0)
+            tax = float(p.get("total_tax") or 0)
+            taxed += 1 if tax else 0
+            gst_by_m[p.get("period")] = tv + tax
         common = [m for m in bm["months"] if m in gst_by_m]
         if common:
             g = sum(gst_by_m[m] for m in common)
             b = sum(x["business_credits"] for x in bm["monthly"] if x["month"] in common)
             v = (g - b) / b if b else 0
             sev = _severity(v)
+            label = "GST invoice value incl. tax" if taxed else "GST taxable value"
             out.append({"id": "C-TURNOVER", "title": "GST-declared turnover vs banking turnover", "severity": sev or "ok",
-                        "variance_pct": round(v * 100, 1), "lhs": {"label": f"GST taxable value ({len(common)} months)", "value": g},
+                        "variance_pct": round(v * 100, 1), "lhs": {"label": f"{label} ({len(common)} months)", "value": g},
                         "rhs": {"label": "Bank business credits (same months)", "value": b}, "months": common,
                         "explain": "GST turnover exceeding banked receipts can mean unbanked cash sales, receipts routed to another account, or inflated GST filings." if v > 0
                         else "Banked receipts exceed GST turnover: possible under-reporting to GST or non-business credits mis-tagged."})
@@ -153,7 +163,7 @@ def contradictions(app, bank, bm, itr, gst, bureau=None):
     # 4. Declared existing EMI vs EMIs actually seen in the bank statement
     if bank:
         declared = float(app.get("declared_existing_emi") or 0)
-        observed = bm["observed_monthly_emi"]
+        observed = bm["observed_monthly_emi"] + bm.get("personal_monthly_emi", 0)
         if observed > declared * 1.10 + 1000:
             v = (observed - declared) / declared if declared else 1.0
             out.append({"id": "C-DEBT", "title": "Declared EMIs vs EMIs observed in bank", "severity": _severity(v) or "medium",
@@ -172,7 +182,8 @@ def policy(app, bm, itr, contra, recon_pct, bureau=None):
     amount, rate, tenure = float(app["loan_amount"]), float(app["interest_rate"]), int(app["tenure_months"])
     new_emi = emi(amount, rate, tenure)
     bureau_emi = float(fval(bureau, "total_monthly_emi") or 0)
-    existing = max(float(app.get("declared_existing_emi") or 0), bm["observed_monthly_emi"] if bm else 0, bureau_emi)
+    observed = (bm["observed_monthly_emi"] + bm.get("personal_monthly_emi", 0)) if bm else 0
+    existing = max(float(app.get("declared_existing_emi") or 0), observed, bureau_emi)
     np_ = fval(itr, "net_profit")
     rules = []
 
@@ -222,42 +233,93 @@ def policy(app, bm, itr, contra, recon_pct, bureau=None):
             "summary": {s: sum(1 for r in rules if r["status"] == s) for s in ("pass", "warn", "fail")}}
 
 
+PERSONAL_HINTS = ("saving", "sb ", "personal", "salary")
+
+
+def _is_personal(ext):
+    t = str(fval(ext, "account_type") or "").lower()
+    return any(h in t for h in PERSONAL_HINTS)
+
+
+def _merge_bank(docs_):
+    rows, checked, ok, breaks = [], 0, 0, []
+    for d in docs_:
+        e = d["extraction"]
+        rows += [{**r, "source": d["filename"]} for r in e.get("rows", [])]
+        rc = e.get("reconciliation") or {}
+        checked += rc.get("rows_checked", 0); ok += rc.get("rows_reconciled", 0); breaks += rc.get("breaks", [])
+    rows.sort(key=lambda r: str(r.get("date")))
+    return {"fields": docs_[0]["extraction"].get("fields", {}), "rows": rows, "accounts": len(docs_),
+            "account_names": [d["filename"] for d in docs_],
+            "reconciliation": {"rows_checked": checked, "rows_reconciled": ok, "pct": round(100 * ok / checked, 1) if checked else 0.0, "breaks": breaks[:10]}}
+
+
+def _merge_bureau(exts):
+    """Several reports (applicant, co-applicant, commercial): de-duplicate loan accounts, sum EMIs, take the weakest score."""
+    accts, seen = [], set()
+    for e in exts:
+        for ac in e.get("accounts") or []:
+            key = (str(ac.get("lender", "")).lower()[:18], str(ac.get("type", "")).lower()[:10], str(ac.get("sanctioned")))
+            if key not in seen:
+                seen.add(key)
+                accts.append(ac)
+    def num(v):
+        try:
+            return float(str(v).replace(",", ""))
+        except (TypeError, ValueError):
+            return 0.0
+    emi_accts = sum(num(a.get("emi")) for a in accts)
+    emi_fields = sum(num(fval(e, "total_monthly_emi")) for e in exts)
+    scores = [num(fval(e, "credit_score")) for e in exts if num(fval(e, "credit_score")) >= 300]
+    dpd = max([num(fval(e, "max_dpd_last_12_months")) for e in exts] or [0])
+    enq = sum(num(fval(e, "enquiries_last_6_months")) for e in exts)
+    reports = [{"subject": fval(e, "subject_name"), "score": fval(e, "credit_score"), "emi": fval(e, "total_monthly_emi")} for e in exts]
+    return {"fields": {"credit_score": {"value": min(scores) if scores else None}, "total_monthly_emi": {"value": emi_accts or emi_fields or None},
+                       "max_dpd_last_12_months": {"value": dpd}, "enquiries_last_6_months": {"value": enq}},
+            "accounts": accts, "reports": reports}
+
+
 def _combine(docs):
-    """Several statements / returns per borrower are normal: merge bank rows and GST periods, take the latest ITR."""
+    """Merge multi-document evidence: business bank accounts (current / CC / OD), personal accounts, GST periods,
+    latest ITR, all bureau reports."""
     ext = {t: [d for d in docs if d.get("status") == "extracted" and d["doc_type"] == t and d.get("extraction")]
            for t in MANDATORY_DOCS + ["bureau_report"]}
-    bank = None
+    bank = personal = None
     if ext["bank_statement"]:
-        rows, checked, ok, breaks = [], 0, 0, []
-        for d in ext["bank_statement"]:
-            e = d["extraction"]
-            rows += [{**r, "source": d["filename"]} for r in e.get("rows", [])]
-            rc = e.get("reconciliation") or {}
-            checked += rc.get("rows_checked", 0); ok += rc.get("rows_reconciled", 0); breaks += rc.get("breaks", [])
-        rows.sort(key=lambda r: str(r.get("date")))
-        first = ext["bank_statement"][0]["extraction"]
-        bank = {"fields": first.get("fields", {}), "rows": rows, "accounts": len(ext["bank_statement"]),
-                "reconciliation": {"rows_checked": checked, "rows_reconciled": ok, "pct": round(100 * ok / checked, 1) if checked else 0.0, "breaks": breaks[:10]}}
+        biz = [d for d in ext["bank_statement"] if not _is_personal(d["extraction"])]
+        pers = [d for d in ext["bank_statement"] if _is_personal(d["extraction"])]
+        if not biz:  # only savings accounts supplied: treat them as the business accounts
+            biz, pers = pers, []
+        bank = _merge_bank(biz)
+        personal = _merge_bank(pers) if pers else None
     gst = None
     if ext["gst_return"]:
         periods = {}
         for d in ext["gst_return"]:
             for p in d["extraction"].get("periods", []):
-                periods.setdefault(p.get("period"), p)
-        gst = {"fields": ext["gst_return"][0]["extraction"].get("fields", {}), "periods": [periods[k] for k in sorted(k for k in periods if k)]}
+                if p.get("period") and p.get("taxable_value"):
+                    periods.setdefault(p.get("period"), p)
+        fields = next((d["extraction"].get("fields") for d in ext["gst_return"] if fval(d["extraction"], "gstin")), {})
+        gst = {"fields": fields, "periods": [periods[k] for k in sorted(periods)]}
     itr = None
     if ext["itr"]:
         itr = max((d["extraction"] for d in ext["itr"]), key=lambda e: str(fval(e, "assessment_year") or fval(e, "financial_year") or ""))
-    bureau = ext["bureau_report"][0]["extraction"] if ext["bureau_report"] else None
+    bureau = _merge_bureau([d["extraction"] for d in ext["bureau_report"]]) if ext["bureau_report"] else None
     sources = {t: [d["id"] for d in v] for t, v in ext.items() if v}
-    return bank, itr, gst, bureau, sources
+    return bank, itr, gst, bureau, sources, personal
 
 
 def analyse(app, docs):
-    bank, itr, gst, bureau, sources = _combine(docs)
+    bank, itr, gst, bureau, sources, personal = _combine(docs)
     bm = bank_metrics(bank) if bank else None
+    if bm is not None:
+        pm = bank_metrics(personal) if personal else None
+        bm["personal_accounts"] = (personal or {}).get("account_names", [])
+        bm["personal_monthly_emi"] = pm["observed_monthly_emi"] if pm else 0
+        bm["personal_emi_lenders"] = pm["emi_lenders"] if pm else []
+        bm["business_accounts"] = bank.get("account_names", [])
     contra = contradictions(app, bank, bm, itr, gst, bureau)
     recon = bank["reconciliation"]["pct"] if bank else None
     pol = policy(app, bm, itr, contra, recon, bureau)
     return {"bank_metrics": bm, "contradictions": contra, "policy": pol, "sources": sources,
-            "bank_accounts": (bank or {}).get("accounts", 0)}
+            "bank_accounts": (bank or {}).get("accounts", 0), "bureau_reports": (bureau or {}).get("reports", [])}
