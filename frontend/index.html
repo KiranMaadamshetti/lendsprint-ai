@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LendSprint - AI Credit Copilot</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="logo">LS</span><div><b>LendSprint</b><small>AI credit underwriting copilot</small></div></div>
+    <div class="top-right">
+      <span id="llm-status" class="pill">checking AI...</span>
+      <label class="actor">Acting as
+        <select id="actor">
+          <option>Priya S. (Credit Officer)</option>
+          <option>Rahul M. (Credit Manager)</option>
+        </select>
+      </label>
+    </div>
+  </header>
+  <div class="synthetic-banner">All borrowers and documents in this demo are <b>synthetic</b>. No real customer data is used.</div>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <button class="btn primary block" id="new-app-btn">+ New application</button>
+      <div class="side-title">Applications</div>
+      <div id="app-list"></div>
+    </aside>
+    <main id="main"></main>
+  </div>
+
+  <dialog id="new-app-dialog">
+    <form id="new-app-form" method="dialog">
+      <h3>New loan application</h3>
+      <label>Prefill a synthetic demo case
+        <select id="prefill"><option value="">- blank -</option></select>
+      </label>
+      <div class="grid2">
+        <label>Borrower name<input name="borrower_name" required /></label>
+        <label>Business name<input name="business_name" required /></label>
+        <label>Constitution<select name="constitution"><option>Proprietorship</option><option>Partnership</option><option>Private Limited</option><option>LLP</option></select></label>
+        <label>Industry<input name="industry" /></label>
+        <label>Business vintage (years)<input name="business_vintage_years" type="number" step="0.5" value="0" /></label>
+        <label>Declared existing EMIs (INR / month)<input name="declared_existing_emi" type="number" value="0" /></label>
+        <label>Loan amount (INR)<input name="loan_amount" type="number" required /></label>
+        <label>Tenure (months)<input name="tenure_months" type="number" required value="60" /></label>
+        <label>Interest rate (% p.a.)<input name="interest_rate" type="number" step="0.05" required value="12" /></label>
+        <label>Purpose<input name="purpose" /></label>
+      </div>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="cancel-new">Cancel</button>
+        <button type="submit" class="btn primary">Create</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
